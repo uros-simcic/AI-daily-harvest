@@ -1,20 +1,38 @@
 #!/usr/bin/env python3
 """Fetch AI news from RSS feeds, summarize with Mistral, email the harvest."""
 
+import html
 import os
 import re
+import smtplib
 import sys
+from datetime import date
+from email.mime.text import MIMEText
+from urllib.parse import urlparse
 
 import feedparser
 import requests
 from dotenv import load_dotenv
 from mistralai.client import Mistral
 
+# domain is used to validate article links before they are hidden
+# behind clickable text in the email
 FEEDS = {
-    "TechCrunch AI": "https://techcrunch.com/category/artificial-intelligence/feed/",
-    "VentureBeat AI": "https://venturebeat.com/category/ai/feed/",
-    "The Rundown AI": "https://rss.beehiiv.com/feeds/2R3C6Bt5wj.xml",
+    "TechCrunch AI": {
+        "feed": "https://techcrunch.com/category/artificial-intelligence/feed/",
+        "domain": "techcrunch.com",
+    },
+    "VentureBeat AI": {
+        "feed": "https://venturebeat.com/category/ai/feed/",
+        "domain": "venturebeat.com",
+    },
+    "The Rundown AI": {
+        "feed": "https://rss.beehiiv.com/feeds/2R3C6Bt5wj.xml",
+        "domain": "therundown.ai",
+    },
 }
+
+REQUIRED_ENV = ("MISTRAL_API_KEY", "GMAIL_USER", "GMAIL_APP_PASSWORD", "GMAIL_TO")
 
 ARTICLES_PER_FEED = 4
 MISTRAL_MODEL = "mistral-small-latest"
@@ -28,6 +46,15 @@ USER_AGENT = (
 TAG_RE = re.compile(r"<[^>]+>")
 
 
+def safe_link(url, domain):
+    """A link may only be hidden behind clickable text if it is https
+    and points at the source's own domain (or a subdomain). Keeps a
+    compromised feed from smuggling foreign urls behind a trusted name."""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    return parsed.scheme == "https" and (host == domain or host.endswith("." + domain))
+
+
 def fetch_articles():
     """Collect recent entries from all feeds.
 
@@ -35,10 +62,10 @@ def fetch_articles():
     kill the whole run.
     """
     articles = []
-    for source, url in FEEDS.items():
+    for source, cfg in FEEDS.items():
         try:
             # download ourselves: feedparser's own fetching has no timeout
-            resp = requests.get(url, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
+            resp = requests.get(cfg["feed"], timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
             resp.raise_for_status()
         except requests.RequestException as e:
             print(f"[warn] {source}: fetch failed: {e}")
@@ -48,10 +75,15 @@ def fetch_articles():
             print(f"[warn] {source}: feed did not parse, skipping")
             continue
         for entry in feed.entries[:ARTICLES_PER_FEED]:
+            link = entry.get("link", "")
+            # drop suspect links before spending a summarization call on them
+            if not safe_link(link, cfg["domain"]):
+                print(f"[warn] {source}: skipping entry with suspect url: {link}")
+                continue
             articles.append({
                 "source": source,
                 "title": entry.get("title", "").strip(),
-                "url": entry.get("link", ""),
+                "url": link,
                 # descriptions often contain embedded HTML, strip to plain text
                 "description": TAG_RE.sub("", entry.get("summary", "")).strip(),
             })
@@ -95,11 +127,50 @@ def summarize(client, article):
     return clean_summary(text)
 
 
+def build_html(items):
+    """Assemble the email body. The source label links to the article
+    (urls were validated by safe_link at fetch time); everything from
+    feeds or the model is escaped so it can't inject markup."""
+    parts = []
+    for a in items:
+        label = html.escape(a["source"].upper()) + ":"
+        summary = html.escape(a["summary"])
+        href = html.escape(a["url"], quote=True)
+        parts.append(f'<p><a href="{href}">{label}</a> {summary}</p>')
+    return "<html><body>" + "\n".join(parts) + "</body></html>"
+
+
+def send_email(html_body):
+    """Send via gmail smtp over ssl. GMAIL_TO may hold several
+    comma-separated addresses - they are delivered as bcc so
+    recipients don't see each other. To add a subscriber, just
+    append their address to GMAIL_TO."""
+    user = os.environ["GMAIL_USER"]
+    recipients = [r.strip() for r in os.environ["GMAIL_TO"].split(",") if r.strip()]
+
+    msg = MIMEText(html_body, "html")
+    msg["Subject"] = f"AI Daily News Harvest — {date.today():%d %b %Y}"
+    msg["From"] = user
+    msg["To"] = user  # real recipients are bcc'd
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+        server.login(user, os.environ["GMAIL_APP_PASSWORD"])
+        server.sendmail(user, recipients, msg.as_string())
+
+
 if __name__ == "__main__":
     load_dotenv()
+    missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
+    if missing:
+        sys.exit(f"missing env vars: {', '.join(missing)}")
+
     items = fetch_articles()
     if not items:
         sys.exit("no articles fetched from any feed")
+
     client = build_client()
     for a in items:
-        print(f"{a['source'].upper()}: {summarize(client, a)}\n{a['url']}\n")
+        a["summary"] = summarize(client, a)
+
+    send_email(build_html(items))
+    print(f"sent {len(items)} articles")
