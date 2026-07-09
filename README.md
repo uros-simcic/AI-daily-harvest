@@ -1,6 +1,6 @@
 # AI Daily Harvest
 
-Daily AI news in your inbox: articles from TechCrunch, VentureBeat and
+AI news, delivered daily: articles from TechCrunch, VentureBeat and
 The Rundown, fetched via RSS, summarized to two sentences each by Mistral,
 and delivered as one email every morning. Runs for free on GitHub Actions —
 no server needed.
