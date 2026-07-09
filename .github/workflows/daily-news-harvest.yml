@@ -1,0 +1,44 @@
+name: Daily News Harvest
+
+on:
+  schedule:
+    # 09:00 UTC daily. github cron is best-effort - runs can start
+    # up to a few hours late at busy times, nothing to fix here
+    - cron: "0 9 * * *"
+  # manual runs from the actions tab, for testing
+  workflow_dispatch: {}
+
+# the job only needs to read the repo, nothing more
+permissions:
+  contents: read
+
+jobs:
+  send-harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: restore list of already sent articles
+        uses: actions/cache@v4
+        with:
+          path: seen_titles.txt
+          # unique key per run + prefix restore: the newest list is
+          # restored at start, the updated one saved after the run
+          key: seen-titles-${{ github.run_id }}
+          restore-keys: seen-titles-
+
+      - run: pip install -r requirements.txt
+
+      - name: fetch, summarize and send
+        env:
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_TO: ${{ secrets.GMAIL_TO }}
+        run: python fetch_and_summarize.py
