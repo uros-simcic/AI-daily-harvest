@@ -1,0 +1,13 @@
+# secrets - never commit
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# dedup state from local test runs (kept in Actions cache on CI)
+seen_titles.txt
+
+# macOS
+.DS_Store
