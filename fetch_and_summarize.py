@@ -45,6 +45,11 @@ USER_AGENT = (
 
 TAG_RE = re.compile(r"<[^>]+>")
 
+# remembers what was already sent; on github actions this file is
+# carried between runs by the actions cache
+SEEN_FILE = "seen_titles.txt"
+SEEN_MAX = 500  # cap so the file doesn't grow forever
+
 
 def safe_link(url, domain):
     """A link may only be hidden behind clickable text if it is https
@@ -127,6 +132,26 @@ def summarize(client, article):
     return clean_summary(text)
 
 
+def title_key(title):
+    """First six words of the title, lowercased, punctuation stripped.
+    Close-enough fingerprint to catch reposts with minor title edits."""
+    words = re.sub(r"[^\w\s]", "", title.lower()).split()
+    return " ".join(words[:6])
+
+
+def load_seen():
+    try:
+        with open(SEEN_FILE) as f:
+            return [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def save_seen(keys):
+    with open(SEEN_FILE, "w") as f:
+        f.write("\n".join(keys[-SEEN_MAX:]) + "\n")
+
+
 def build_html(items):
     """Assemble the email body. The source label links to the article
     (urls were validated by safe_link at fetch time); everything from
@@ -168,9 +193,21 @@ if __name__ == "__main__":
     if not items:
         sys.exit("no articles fetched from any feed")
 
+    # skip anything already sent on a previous day
+    seen = load_seen()
+    fresh = [a for a in items if title_key(a["title"]) not in seen]
+    if len(fresh) < len(items):
+        print(f"skipped {len(items) - len(fresh)} previously sent article(s)")
+    if not fresh:
+        print("nothing new today, no email sent")
+        sys.exit()
+
     client = build_client()
-    for a in items:
+    for a in fresh:
         a["summary"] = summarize(client, a)
 
-    send_email(build_html(items))
-    print(f"sent {len(items)} articles")
+    send_email(build_html(fresh))
+    # only remember articles after the send succeeded, so a failed
+    # run retries them tomorrow instead of losing them
+    save_seen(seen + [title_key(a["title"]) for a in fresh])
+    print(f"sent {len(fresh)} articles")
