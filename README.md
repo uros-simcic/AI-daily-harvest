@@ -66,9 +66,9 @@ the repository secret. Recipients are BCC'd and never see each other.
 
 ## See also
 
-[yt-weekly-review](https://github.com/uros-simcic/yt-weekly-review) — the
-same idea for YouTube: new videos on your chosen channels, summarized by
-Gemini into three timestamped key takes, emailed once a week.
+[yt-weekly-review](https://github.com/uros-simcic/yt-weekly-review) —
+YouTube channels, reviewed weekly: three timestamped key takes per new
+video, one email every Sunday.
 
 ## License
 
