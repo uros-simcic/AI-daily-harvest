@@ -64,6 +64,12 @@ The sent-articles list is carried between runs by the Actions cache.
 Append the address to `GMAIL_TO` (comma-separated) in your `.env` and in
 the repository secret. Recipients are BCC'd and never see each other.
 
+## See also
+
+[yt-weekly-review](https://github.com/uros-simcic/yt-weekly-review) — the
+same idea for YouTube: new videos on your chosen channels, summarized by
+Gemini into three timestamped key takes, emailed once a week.
+
 ## License
 
 [MIT](LICENSE)
