@@ -32,6 +32,8 @@ FEEDS = {
     "The Rundown AI": {
         "feed": "https://rss.beehiiv.com/feeds/2R3C6Bt5wj.xml",
         "domain": "therundown.ai",
+        # each daily post bundles several stories - split them apart
+        "split_issue": True,
     },
 }
 
@@ -39,6 +41,7 @@ REQUIRED_ENV = ("MISTRAL_API_KEY", "GMAIL_USER", "GMAIL_APP_PASSWORD", "GMAIL_TO
 
 ARTICLES_PER_FEED = 4
 MAX_ENTRY_AGE_DAYS = 3  # ignore entries older than this, see entry_is_fresh
+MAX_STORY_CHARS = 1500  # cap per-story text sent to the model
 MISTRAL_MODEL = "mistral-small-latest"
 HTTP_TIMEOUT = 15
 # some news sites 403 requests without a browser-like user agent
@@ -74,6 +77,36 @@ def entry_is_fresh(entry):
     return time.mktime(published) >= time.time() - MAX_ENTRY_AGE_DAYS * 86400
 
 
+def split_issue(entry, source, domain):
+    """The Rundown's daily post bundles several stories with ads and
+    tool guides in between. Split the post body on its headings and
+    keep only blocks with a 'Why it matters' section - real news
+    stories always have one, ads and guides never do. The individual
+    stories have no urls of their own, so they share the post's url."""
+    link = entry.get("link", "")
+    if not safe_link(link, domain):
+        print(f"[warn] {source}: skipping issue with suspect url: {link}")
+        return []
+    body = entry.get("content", [{}])[0].get("value", "") or entry.get("summary", "")
+    stories = []
+    # split keeps the heading texts at odd indexes, block bodies follow
+    parts = re.split(r"<h[34][^>]*>(.*?)</h[34]>", body, flags=re.S)
+    for i in range(1, len(parts) - 1, 2):
+        text = re.sub(r"\s+", " ", TAG_RE.sub(" ", parts[i + 1])).strip()
+        if "Why it matters" not in text:
+            continue
+        # drop image credits and other lead-in before the story text
+        if "The Rundown:" in text:
+            text = text[text.index("The Rundown:"):]
+        stories.append({
+            "source": source,
+            "title": TAG_RE.sub("", parts[i]).strip(),
+            "url": link,
+            "description": text[:MAX_STORY_CHARS],
+        })
+    return stories
+
+
 def fetch_articles():
     """Collect recent entries from all feeds.
 
@@ -95,6 +128,9 @@ def fetch_articles():
             continue
         for entry in feed.entries[:ARTICLES_PER_FEED]:
             if not entry_is_fresh(entry):
+                continue
+            if cfg.get("split_issue"):
+                articles += split_issue(entry, source, cfg["domain"])
                 continue
             link = entry.get("link", "")
             # drop suspect links before spending a summarization call on them
