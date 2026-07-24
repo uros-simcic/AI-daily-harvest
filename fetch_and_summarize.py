@@ -184,6 +184,34 @@ def summarize(client, article):
     return clean_summary(text)
 
 
+def drop_duplicate_stories(client, articles):
+    """Different sites cover the same story under different headlines.
+    One cheap model call flags them so only the first occurrence stays.
+    On any api or parsing problem nothing is dropped."""
+    if len(articles) < 2:
+        return articles
+    listing = "\n".join(f"{i}. {a['title']}" for i, a in enumerate(articles, 1))
+    prompt = (
+        "These are today's news headlines. Some may report the same story. "
+        "Reply with only the numbers of headlines to drop as duplicates, "
+        "keeping the first of each group. Comma-separated numbers or 'none'.\n"
+        + listing
+    )
+    try:
+        resp = client.chat.complete(
+            model=MISTRAL_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        drop = {int(n) for n in re.findall(r"\d+", resp.choices[0].message.content)}
+    except Exception as e:
+        print(f"[warn] duplicate check failed: {e}")
+        return articles
+    for i in sorted(drop):
+        if 1 <= i <= len(articles):
+            print(f"dropped cross-source duplicate: {articles[i - 1]['title']}")
+    return [a for i, a in enumerate(articles, 1) if i not in drop]
+
+
 def title_key(title):
     """First six words of the title, lowercased, punctuation stripped.
     Close-enough fingerprint to catch reposts with minor title edits."""
@@ -255,11 +283,19 @@ if __name__ == "__main__":
         sys.exit()
 
     client = build_client()
+    # duplicates dropped here are still remembered below, so the same
+    # story can't come back tomorrow through the other site's feed
+    candidates = fresh
+    fresh = drop_duplicate_stories(client, fresh)
+    if not fresh:
+        print("nothing new today, no email sent")
+        sys.exit()
+
     for a in fresh:
         a["summary"] = summarize(client, a)
 
     send_email(build_html(fresh))
     # only remember articles after the send succeeded, so a failed
     # run retries them tomorrow instead of losing them
-    save_seen(seen + [title_key(a["title"]) for a in fresh])
+    save_seen(seen + [title_key(a["title"]) for a in candidates])
     print(f"sent {len(fresh)} articles")
