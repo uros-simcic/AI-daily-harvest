@@ -6,6 +6,7 @@ import os
 import re
 import smtplib
 import sys
+import time
 from datetime import date
 from email.mime.text import MIMEText
 from urllib.parse import urlparse
@@ -23,7 +24,9 @@ FEEDS = {
         "domain": "techcrunch.com",
     },
     "VentureBeat AI": {
-        "feed": "https://venturebeat.com/category/ai/feed/",
+        # the category/ai feed froze on a fixed set of old articles;
+        # the site feed is chronological and effectively all AI anyway
+        "feed": "https://venturebeat.com/feed/",
         "domain": "venturebeat.com",
     },
     "The Rundown AI": {
@@ -35,6 +38,7 @@ FEEDS = {
 REQUIRED_ENV = ("MISTRAL_API_KEY", "GMAIL_USER", "GMAIL_APP_PASSWORD", "GMAIL_TO")
 
 ARTICLES_PER_FEED = 4
+MAX_ENTRY_AGE_DAYS = 3  # ignore entries older than this, see entry_is_fresh
 MISTRAL_MODEL = "mistral-small-latest"
 HTTP_TIMEOUT = 15
 # some news sites 403 requests without a browser-like user agent
@@ -60,6 +64,16 @@ def safe_link(url, domain):
     return parsed.scheme == "https" and (host == domain or host.endswith("." + domain))
 
 
+def entry_is_fresh(entry):
+    """Ignore entries older than a few days. A feed that re-lists old
+    items (venturebeat's frozen category feed did exactly that) must
+    not be able to push stale news. Entries without a date pass."""
+    published = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not published:
+        return True
+    return time.mktime(published) >= time.time() - MAX_ENTRY_AGE_DAYS * 86400
+
+
 def fetch_articles():
     """Collect recent entries from all feeds.
 
@@ -80,6 +94,8 @@ def fetch_articles():
             print(f"[warn] {source}: feed did not parse, skipping")
             continue
         for entry in feed.entries[:ARTICLES_PER_FEED]:
+            if not entry_is_fresh(entry):
+                continue
             link = entry.get("link", "")
             # drop suspect links before spending a summarization call on them
             if not safe_link(link, cfg["domain"]):
