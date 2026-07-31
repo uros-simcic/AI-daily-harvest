@@ -197,6 +197,7 @@ SIG_MIN_WORD = 4  # shorter words are noise unless they carry a digit
 DUP_MIN_SHARED = 4
 DUP_MIN_CONTAINMENT = 0.30
 DUP_SNIPPET_CHARS = 300  # per-story text sent to the duplicate model
+DUP_MAX_DROP_RATIO = 0.5  # refuse a verdict that would delete half the harvest
 DUP_RETRIES = 2
 # The model may lower the lexical bar but not ignore it. Left to itself
 # it paired two stories with no words in common at all, and another two
@@ -392,10 +393,18 @@ def drop_duplicate_stories(client, articles):
     if len(articles) < 2:
         return articles
     print(f"[dup] checking {len(articles)} stories for cross-source duplicates")
+    # a pass that wants to delete half the harvest has misfired; a real
+    # day never has that much repetition. Discard that pass rather than
+    # send a nearly empty email
+    limit = len(articles) * DUP_MAX_DROP_RATIO
 
     dropped = lexical_duplicates(articles)
     if not dropped:
         print("[dup/lexical] no duplicates found")
+    elif len(dropped) > limit:
+        print(f"[warn] lexical pass wanted to drop {len(dropped)} of "
+              f"{len(articles)} stories, that is too many - ignoring it")
+        dropped = {}
 
     survivors = [i for i in range(len(articles)) if i not in dropped]
     if len(survivors) > 1:
@@ -403,8 +412,15 @@ def drop_duplicate_stories(client, articles):
         model_drops = llm_duplicates(client, offered)
         if not model_drops:
             print("[dup/model] no further duplicates found")
+        proposed = dict(dropped)
         for drop, keep in model_drops.items():
-            dropped[survivors[drop]] = survivors[keep]
+            proposed[survivors[drop]] = survivors[keep]
+        if len(proposed) > limit:
+            print(f"[warn] duplicate check wanted to drop {len(proposed)} of "
+                  f"{len(articles)} stories, that is too many - ignoring the "
+                  f"model pass")
+        else:
+            dropped = proposed
 
     kept = [a for i, a in enumerate(articles) if i not in dropped]
     print(f"[dup] dropped {len(dropped)} duplicate(s), {len(kept)} stories remain")
