@@ -2,6 +2,7 @@
 """Fetch AI news from RSS feeds, summarize with Mistral, email the harvest."""
 
 import html
+import itertools
 import json
 import os
 import re
@@ -187,8 +188,85 @@ def summarize(client, article):
     return clean_summary(text)
 
 
+SIG_DESC_CHARS = 200  # description prefix that feeds a story signature
+SIG_MIN_WORD = 4  # shorter words are noise unless they carry a digit
+# tuned against real harvests: genuine cross-source pairs score a
+# containment of 0.33 and up, the closest merely-related pair sits at
+# 0.23, so the cut sits in the gap between them
+DUP_MIN_SHARED = 4
+DUP_MIN_CONTAINMENT = 0.30
 DUP_SNIPPET_CHARS = 300  # per-story text sent to the duplicate model
 DUP_RETRIES = 2
+
+# words too common in news copy to say anything about which story it is
+SIG_STOPWORDS = frozenset("""
+about after again against along already also although always among another
+around because become been before behind being below better between both
+build built came come could does doing done down during each early even
+every first from further gave general getting give given going gone good
+great half hand have having here high hold home however into just keep
+kept know known large last late later least less like little long made make
+many maybe more most much must near need never next once only open other
+others ours over part past people perhaps place plus rather really right
+said same says seen several shall should show shown since some soon still
+such take taken tell than that their them then there these they thing think
+this those though three through thus time today together took toward under
+until upon used uses using very want week well went were what when where
+which while with within without work would year years your
+""".split())
+
+# keep internal hyphens and dots so mai-cyber-1-flash and 2.8t survive
+SIG_PUNCT_RE = re.compile(r"[^\w.\-]+")
+# every rundown story body opens with this, it distinguishes nothing
+RUNDOWN_LEAD_RE = re.compile(r"^\s*the rundown:\s*", re.I)
+
+
+def story_signature(article):
+    """The set of words that identify which story an item is about.
+
+    Title plus the start of the description, lowercased, with emoji,
+    punctuation and filler words removed. Short words are dropped
+    unless they contain a digit, because that is where the model
+    names live - k3, 2.8t, mai-cyber-1-flash.
+    """
+    desc = RUNDOWN_LEAD_RE.sub("", html.unescape(article.get("description", "")))
+    text = html.unescape(article.get("title", "")) + " " + desc[:SIG_DESC_CHARS]
+    tokens = set()
+    for raw in SIG_PUNCT_RE.sub(" ", text.lower()).split():
+        token = raw.strip(".-")
+        if not token or token in SIG_STOPWORDS:
+            continue
+        if len(token) >= SIG_MIN_WORD or any(c.isdigit() for c in token):
+            tokens.add(token)
+    return tokens
+
+
+def lexical_duplicates(articles):
+    """Pair up stories whose signatures overlap enough to be the same
+    news. Deliberately strict: it should never merge two real stories,
+    the model pass afterwards is what catches the subtler pairs.
+
+    Returns {index to drop: index it duplicates}, keeping the earliest
+    listed item of each group.
+    """
+    signatures = [story_signature(a) for a in articles]
+    drops = {}
+    for i, j in itertools.combinations(range(len(articles)), 2):
+        shared = signatures[i] & signatures[j]
+        smaller = min(len(signatures[i]), len(signatures[j])) or 1
+        if len(shared) < DUP_MIN_SHARED or len(shared) / smaller < DUP_MIN_CONTAINMENT:
+            continue
+        keep, drop = i, j
+        while keep in drops:  # fold into the group's surviving item
+            keep = drops[keep]
+        if drop == keep or drop in drops:
+            continue
+        drops[drop] = keep
+        print(f"[dup/lexical] '{articles[drop]['title']}' duplicates "
+              f"'{articles[keep]['title']}' "
+              f"(shared={len(shared)}, overlap={len(shared) / smaller:.2f}, "
+              f"terms={sorted(shared)})")
+    return drops
 
 
 def parse_duplicate_groups(reply, count):
@@ -224,7 +302,7 @@ def parse_duplicate_groups(reply, count):
 
 
 def llm_duplicates(client, articles):
-    """Ask the model which stories are the same news.
+    """Ask the model which of the remaining stories are the same news.
 
     Returns {index to drop: index it duplicates}, or {} if the model
     never answers usably - a failure here must cost us nothing but a
@@ -280,15 +358,26 @@ def llm_duplicates(client, articles):
 
 def drop_duplicate_stories(client, articles):
     """Different sites cover the same story under different headlines.
-    The model groups them so only the first of each group stays. Every
-    decision is logged, and on any api or parsing problem nothing is
-    dropped."""
+    A lexical pass catches the obvious repeats without an api call, then
+    the model looks over what is left. Every decision is logged, and on
+    any api or parsing problem nothing is dropped."""
     if len(articles) < 2:
         return articles
     print(f"[dup] checking {len(articles)} stories for cross-source duplicates")
-    dropped = llm_duplicates(client, articles)
+
+    dropped = lexical_duplicates(articles)
     if not dropped:
-        print("[dup/model] no duplicates found")
+        print("[dup/lexical] no duplicates found")
+
+    survivors = [i for i in range(len(articles)) if i not in dropped]
+    if len(survivors) > 1:
+        offered = [articles[i] for i in survivors]
+        model_drops = llm_duplicates(client, offered)
+        if not model_drops:
+            print("[dup/model] no further duplicates found")
+        for drop, keep in model_drops.items():
+            dropped[survivors[drop]] = survivors[keep]
+
     kept = [a for i, a in enumerate(articles) if i not in dropped]
     print(f"[dup] dropped {len(dropped)} duplicate(s), {len(kept)} stories remain")
     return kept
