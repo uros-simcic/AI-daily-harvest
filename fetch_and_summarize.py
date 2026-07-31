@@ -2,6 +2,7 @@
 """Fetch AI news from RSS feeds, summarize with Mistral, email the harvest."""
 
 import html
+import json
 import os
 import re
 import smtplib
@@ -43,6 +44,8 @@ ARTICLES_PER_FEED = 4
 MAX_ENTRY_AGE_DAYS = 3  # ignore entries older than this, see entry_is_fresh
 MAX_STORY_CHARS = 1500  # cap per-story text sent to the model
 MISTRAL_MODEL = "mistral-small-latest"
+# duplicate spotting is harder than summarizing, so it gets a bigger model
+DUP_MODEL = "mistral-medium-latest"
 HTTP_TIMEOUT = 15
 # some news sites 403 requests without a browser-like user agent
 USER_AGENT = (
@@ -184,32 +187,111 @@ def summarize(client, article):
     return clean_summary(text)
 
 
-def drop_duplicate_stories(client, articles):
-    """Different sites cover the same story under different headlines.
-    One cheap model call flags them so only the first occurrence stays.
-    On any api or parsing problem nothing is dropped."""
-    if len(articles) < 2:
-        return articles
-    listing = "\n".join(f"{i}. {a['title']}" for i, a in enumerate(articles, 1))
+DUP_SNIPPET_CHARS = 300  # per-story text sent to the duplicate model
+DUP_RETRIES = 2
+
+
+def parse_duplicate_groups(reply, count):
+    """Read the model's JSON verdict into groups of 1-based indexes.
+
+    Strictly json, never a digit scrape: headlines are full of numbers
+    ('Kimi K3', 'GPT-5.6') and scraping them deletes real articles. The
+    old prompt asked for numbers to drop and the model would return
+    every member of a group, taking the story out altogether.
+    Raises ValueError on anything malformed so the caller can retry.
+    """
+    text = reply.strip()
+    if text.startswith("```"):  # models like to fence their json
+        text = re.sub(r"^```[a-z]*\s*|\s*```$", "", text, flags=re.S).strip()
+    payload = json.loads(text)
+    if not isinstance(payload, dict) or not isinstance(payload.get("groups"), list):
+        raise ValueError(f"expected an object with a 'groups' list, got {payload!r}")
+    groups = []
+    for group in payload["groups"]:
+        if not isinstance(group, list):
+            raise ValueError(f"group is not a list: {group!r}")
+        members = []
+        for n in group:
+            if not isinstance(n, int) or isinstance(n, bool):
+                raise ValueError(f"group member is not an integer: {n!r}")
+            if not 1 <= n <= count:
+                raise ValueError(f"index {n} outside 1..{count}")
+            if n not in members:
+                members.append(n)
+        if len(members) > 1:
+            groups.append(sorted(members))
+    return groups
+
+
+def llm_duplicates(client, articles):
+    """Ask the model which stories are the same news.
+
+    Returns {index to drop: index it duplicates}, or {} if the model
+    never answers usably - a failure here must cost us nothing but a
+    duplicate in the email.
+    """
+    listing = "\n\n".join(
+        f"{i}. {a['title']}\n{a['description'][:DUP_SNIPPET_CHARS]}"
+        for i, a in enumerate(articles, 1)
+    )
     prompt = (
-        "These are today's news headlines. Some may report the same story. "
-        "Reply with only the numbers of headlines to drop as duplicates, "
-        "keeping the first of each group. Comma-separated numbers or 'none'.\n"
+        "Below are today's AI news stories, each numbered. Different outlets "
+        "sometimes cover the same underlying news. Group the numbers that "
+        "report the same news event.\n\n"
+        "Answer with JSON and nothing else, in exactly this shape:\n"
+        '{"groups": [[2, 7], [4, 5]]}\n'
+        "Each inner list holds every number covering one news event. Only "
+        "group stories about the same event - stories that merely share a "
+        "company or a theme are different stories. If nothing is duplicated, "
+        'answer {"groups": []}.\n\n'
         + listing
     )
-    try:
-        resp = client.chat.complete(
-            model=MISTRAL_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        drop = {int(n) for n in re.findall(r"\d+", resp.choices[0].message.content)}
-    except Exception as e:
-        print(f"[warn] duplicate check failed: {e}")
+    reply = ""
+    for attempt in range(DUP_RETRIES + 1):
+        try:
+            resp = client.chat.complete(
+                model=DUP_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            reply = resp.choices[0].message.content or ""
+            groups = parse_duplicate_groups(reply, len(articles))
+            break
+        except Exception as e:
+            print(f"[warn] duplicate check attempt {attempt + 1} failed: {e}")
+            if reply:
+                print(f"[warn] raw reply was: {reply!r}")
+            if attempt == DUP_RETRIES:
+                print("[warn] duplicate check gave up, keeping every story")
+                return {}
+            time.sleep(2 ** attempt)
+
+    drops = {}
+    for group in groups:
+        keep = group[0] - 1
+        for n in group[1:]:
+            drop = n - 1
+            if drop in drops:
+                continue
+            drops[drop] = keep
+            print(f"[dup/model] '{articles[drop]['title']}' duplicates "
+                  f"'{articles[keep]['title']}'")
+    return drops
+
+
+def drop_duplicate_stories(client, articles):
+    """Different sites cover the same story under different headlines.
+    The model groups them so only the first of each group stays. Every
+    decision is logged, and on any api or parsing problem nothing is
+    dropped."""
+    if len(articles) < 2:
         return articles
-    for i in sorted(drop):
-        if 1 <= i <= len(articles):
-            print(f"dropped cross-source duplicate: {articles[i - 1]['title']}")
-    return [a for i, a in enumerate(articles, 1) if i not in drop]
+    print(f"[dup] checking {len(articles)} stories for cross-source duplicates")
+    dropped = llm_duplicates(client, articles)
+    if not dropped:
+        print("[dup/model] no duplicates found")
+    kept = [a for i, a in enumerate(articles) if i not in dropped]
+    print(f"[dup] dropped {len(dropped)} duplicate(s), {len(kept)} stories remain")
+    return kept
 
 
 def title_key(title):
