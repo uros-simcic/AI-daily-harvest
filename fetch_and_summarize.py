@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fetch AI news from RSS feeds, summarize with Mistral, email the harvest."""
 
+import collections
 import html
 import itertools
 import json
@@ -197,6 +198,15 @@ DUP_MIN_SHARED = 4
 DUP_MIN_CONTAINMENT = 0.30
 DUP_SNIPPET_CHARS = 300  # per-story text sent to the duplicate model
 DUP_RETRIES = 2
+# The model may lower the lexical bar but not ignore it. Left to itself
+# it paired two stories with no words in common at all, and another two
+# whose only link was 'openai' and 'models' - words half the harvest
+# shares on any given day. So a pair it proposes still has to clear a
+# containment just under the lexical one, on terms that are rare enough
+# that day to mean something.
+DUP_LLM_MIN_CONTAINMENT = 0.25
+DUP_LLM_MIN_DISTINCT = 2
+DUP_COMMON_DF_RATIO = 0.25  # a term in more of the day's stories is filler
 
 # words too common in news copy to say anything about which story it is
 SIG_STOPWORDS = frozenset("""
@@ -343,6 +353,13 @@ def llm_duplicates(client, articles):
                 return {}
             time.sleep(2 ** attempt)
 
+    signatures = [story_signature(a) for a in articles]
+    # how many of today's stories each term shows up in - a term in lots
+    # of them says nothing about which story this is. Two stories is the
+    # fewest a shared term can appear in, so it always counts as rare.
+    seen_in = collections.Counter(t for sig in signatures for t in sig)
+    common_at = max(2, len(articles) * DUP_COMMON_DF_RATIO)
+
     drops = {}
     for group in groups:
         keep = group[0] - 1
@@ -350,9 +367,20 @@ def llm_duplicates(client, articles):
             drop = n - 1
             if drop in drops:
                 continue
+            shared = signatures[keep] & signatures[drop]
+            smaller = min(len(signatures[keep]), len(signatures[drop])) or 1
+            distinct = sorted(t for t in shared if seen_in[t] <= common_at)
+            overlap = len(shared) / smaller
+            if len(distinct) < DUP_LLM_MIN_DISTINCT or overlap < DUP_LLM_MIN_CONTAINMENT:
+                print(f"[dup/model] ignoring unsupported pair: "
+                      f"'{articles[drop]['title']}' vs "
+                      f"'{articles[keep]['title']}' "
+                      f"(overlap={overlap:.2f}, distinctive={distinct})")
+                continue
             drops[drop] = keep
             print(f"[dup/model] '{articles[drop]['title']}' duplicates "
-                  f"'{articles[keep]['title']}'")
+                  f"'{articles[keep]['title']}' "
+                  f"(overlap={overlap:.2f}, distinctive={distinct})")
     return drops
 
 
