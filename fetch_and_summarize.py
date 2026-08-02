@@ -97,7 +97,8 @@ def split_issue(entry, source, domain):
     # split keeps the heading texts at odd indexes, block bodies follow
     parts = re.split(r"<h[34][^>]*>(.*?)</h[34]>", body, flags=re.S)
     for i in range(1, len(parts) - 1, 2):
-        text = re.sub(r"\s+", " ", TAG_RE.sub(" ", parts[i + 1])).strip()
+        text = re.sub(r"\s+", " ",
+                      html.unescape(TAG_RE.sub(" ", parts[i + 1]))).strip()
         if "Why it matters" not in text:
             continue
         # drop image credits and other lead-in before the story text
@@ -146,8 +147,12 @@ def fetch_articles():
                 "source": source,
                 "title": entry.get("title", "").strip(),
                 "url": link,
-                # descriptions often contain embedded HTML, strip to plain text
-                "description": TAG_RE.sub("", entry.get("summary", "")).strip(),
+                # descriptions often contain embedded HTML, strip to plain
+                # text. Feeds double-encode their entities, so unescape
+                # once more afterwards or a &quot; survives all the way
+                # into the email as visible text
+                "description": html.unescape(
+                    TAG_RE.sub("", entry.get("summary", ""))).strip(),
             })
     return articles
 
