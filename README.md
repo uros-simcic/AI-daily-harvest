@@ -16,10 +16,17 @@ no server needed.
    anything else is dropped. Articles already sent on a previous day are
    skipped (fingerprint: first six words of the title), so reposts with
    small title edits don't show up twice.
-3. **Summarize** — one Mistral call per article turns title + feed
-   description into a two-sentence summary. If a call fails, the feed's
-   own description is used instead.
-4. **Send** — a single email via Gmail. Each entry is a clickable source
+3. **Deduplicate** — the three sources often run the same story under
+   different headlines. A word-overlap pass catches the obvious repeats
+   with no API call at all; a single call to a larger model then reviews
+   whatever is left, and its verdict counts only for pairs the wording
+   already supports. The first listed copy of a story is the one kept.
+   If the check fails nothing is dropped, and a pass that would delete
+   half the harvest is thrown out rather than mail a near-empty email.
+4. **Summarize** — one Mistral call per surviving article turns title +
+   feed description into a two-sentence summary. If a call fails, the
+   feed's own description is used instead.
+5. **Send** — a single email via Gmail. Each entry is a clickable source
    label followed by the summary. Recipients are BCC'd, so a small
    subscriber list works out of the box.
 
