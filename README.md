@@ -11,7 +11,11 @@ no server needed.
 
 1. **Fetch** — pulls the latest entries from each source's RSS feed.
    Feeds are downloaded with a timeout and parsed with feedparser; a dead
-   feed is skipped, the others still deliver.
+   feed is skipped, the others still deliver. VentureBeat's own feed is
+   blocked from GitHub Actions, so that source falls back to Bing's
+   VentureBeat RSS (the emailed links still point at venturebeat.com).
+   The Rundown's posts are accepted from both therundown.ai and
+   Beehiiv, which is where those issues are published now.
 2. **Filter** — article links must be https on the source's own domain,
    anything else is dropped. Articles already sent on a previous day are
    skipped (fingerprint: first six words of the title), so reposts with

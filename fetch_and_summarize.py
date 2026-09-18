@@ -12,29 +12,37 @@ import sys
 import time
 from datetime import date
 from email.mime.text import MIMEText
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import feedparser
 import requests
 from dotenv import load_dotenv
 from mistralai.client import Mistral
 
-# domain is used to validate article links before they are hidden
-# behind clickable text in the email
+# domains are used to validate article links before they are hidden
+# behind clickable text in the email. A feed may list more than one
+# host when the publisher serves the same site from several names.
 FEEDS = {
     "TechCrunch AI": {
         "feed": "https://techcrunch.com/category/artificial-intelligence/feed/",
-        "domain": "techcrunch.com",
+        "domains": ["techcrunch.com"],
     },
     "VentureBeat AI": {
         # the category/ai feed froze on a fixed set of old articles;
-        # the site feed is chronological and effectively all AI anyway
-        "feed": "https://venturebeat.com/feed/",
-        "domain": "venturebeat.com",
+        # the site feed is chronological and effectively all AI anyway.
+        # venturebeat.com itself 429s github actions (vercel bot
+        # checkpoint), so bing news rss is the working fallback and
+        # still carries the original venturebeat.com article urls
+        "feed": [
+            "https://venturebeat.com/feed/",
+            "https://www.bing.com/news/search?q=site%3Aventurebeat.com&format=rss",
+        ],
+        "domains": ["venturebeat.com"],
     },
     "The Rundown AI": {
         "feed": "https://rss.beehiiv.com/feeds/2R3C6Bt5wj.xml",
-        "domain": "therundown.ai",
+        # posts used to live on therundown.ai; beehiiv now serves them
+        "domains": ["therundown.ai", "therundownai.beehiiv.com"],
         # each daily post bundles several stories - split them apart
         "split_issue": True,
     },
@@ -63,13 +71,77 @@ SEEN_FILE = "seen_titles.txt"
 SEEN_MAX = 500  # cap so the file doesn't grow forever
 
 
-def safe_link(url, domain):
+def safe_link(url, domains):
     """A link may only be hidden behind clickable text if it is https
-    and points at the source's own domain (or a subdomain). Keeps a
-    compromised feed from smuggling foreign urls behind a trusted name."""
+    and points at one of the source's own domains (or a subdomain).
+    Keeps a compromised feed from smuggling foreign urls behind a
+    trusted name."""
     parsed = urlparse(url)
-    host = parsed.hostname or ""
-    return parsed.scheme == "https" and (host == domain or host.endswith("." + domain))
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host:
+        return False
+    if isinstance(domains, str):
+        domains = [domains]
+    for domain in domains:
+        domain = domain.lower()
+        if host == domain or host.endswith("." + domain):
+            return True
+    return False
+
+
+def unwrap_article_url(url):
+    """Pull the publisher url out of a news-aggregator click-through.
+
+    Bing's RSS items wrap the real article in apiclick.aspx?url=...
+    Feedparser already unescapes XML entities, but we unescape again
+    so a raw XML snippet still works."""
+    url = html.unescape(url).strip()
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host in ("www.bing.com", "bing.com"):
+        target = parse_qs(parsed.query).get("url", [None])[0]
+        if target:
+            return html.unescape(target).strip()
+    return url
+
+
+def looks_like_feed(content, content_type=""):
+    """True if the body is RSS/Atom, not an HTML challenge page."""
+    head = content.lstrip()[:200].lower()
+    if head.startswith(b"<!doctype html") or head.startswith(b"<html"):
+        return False
+    ctype = (content_type or "").lower()
+    if any(token in ctype for token in ("xml", "rss", "atom")):
+        return True
+    return head.startswith((b"<?xml", b"<rss", b"<feed"))
+
+
+def download_feed(urls, source):
+    """Try each feed url until one returns parseable RSS/Atom.
+
+    A 403/429 or an HTML bot-checkpoint is not fatal: the next url
+    in the list (if any) is tried instead.
+    """
+    if isinstance(urls, str):
+        urls = [urls]
+    for i, url in enumerate(urls):
+        try:
+            resp = requests.get(
+                url, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT}
+            )
+        except requests.RequestException as e:
+            print(f"[warn] {source}: fetch failed: {e}")
+            continue
+        if resp.status_code >= 400:
+            print(f"[warn] {source}: fetch failed: {resp.status_code} {url}")
+            continue
+        if not looks_like_feed(resp.content, resp.headers.get("content-type", "")):
+            print(f"[warn] {source}: response was not a feed, skipping {url}")
+            continue
+        if i:
+            print(f"[info] {source}: using fallback feed {url}")
+        return resp.content
+    return None
 
 
 def entry_is_fresh(entry):
@@ -88,7 +160,7 @@ def split_issue(entry, source, domain):
     keep only blocks with a 'Why it matters' section - real news
     stories always have one, ads and guides never do. The individual
     stories have no urls of their own, so they share the post's url."""
-    link = entry.get("link", "")
+    link = unwrap_article_url(entry.get("link", ""))
     if not safe_link(link, domain):
         print(f"[warn] {source}: skipping issue with suspect url: {link}")
         return []
@@ -121,26 +193,25 @@ def fetch_articles():
     """
     articles = []
     for source, cfg in FEEDS.items():
-        try:
-            # download ourselves: feedparser's own fetching has no timeout
-            resp = requests.get(cfg["feed"], timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f"[warn] {source}: fetch failed: {e}")
+        # download ourselves: feedparser's own fetching has no timeout
+        raw = download_feed(cfg["feed"], source)
+        if raw is None:
+            print(f"[warn] {source}: every listed feed failed, skipping")
             continue
-        feed = feedparser.parse(resp.content)
+        feed = feedparser.parse(raw)
         if feed.bozo and not feed.entries:
             print(f"[warn] {source}: feed did not parse, skipping")
             continue
+        before = len(articles)
         for entry in feed.entries[:ARTICLES_PER_FEED]:
             if not entry_is_fresh(entry):
                 continue
             if cfg.get("split_issue"):
-                articles += split_issue(entry, source, cfg["domain"])
+                articles += split_issue(entry, source, cfg["domains"])
                 continue
-            link = entry.get("link", "")
+            link = unwrap_article_url(entry.get("link", ""))
             # drop suspect links before spending a summarization call on them
-            if not safe_link(link, cfg["domain"]):
+            if not safe_link(link, cfg["domains"]):
                 print(f"[warn] {source}: skipping entry with suspect url: {link}")
                 continue
             articles.append({
@@ -154,6 +225,8 @@ def fetch_articles():
                 "description": html.unescape(
                     TAG_RE.sub("", entry.get("summary", ""))).strip(),
             })
+        kept = len(articles) - before
+        print(f"[info] {source}: kept {kept} article(s)")
     return articles
 
 
