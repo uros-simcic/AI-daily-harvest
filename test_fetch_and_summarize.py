@@ -3,7 +3,13 @@
 
 import unittest
 
-from fetch_and_summarize import looks_like_feed, safe_link, unwrap_article_url
+from fetch_and_summarize import (
+    is_rate_limited,
+    looks_like_feed,
+    parse_summaries,
+    safe_link,
+    unwrap_article_url,
+)
 
 
 class SafeLinkTests(unittest.TestCase):
@@ -61,6 +67,33 @@ class LooksLikeFeedTests(unittest.TestCase):
     def test_html_challenge_rejected(self):
         body = b'<!DOCTYPE html><html lang="en"><head><title>Vercel Security Checkpoint</title>'
         self.assertFalse(looks_like_feed(body, "text/html; charset=utf-8"))
+
+
+class SummaryParseTests(unittest.TestCase):
+    def test_plain_json(self):
+        self.assertEqual(
+            parse_summaries('{"summaries": ["one", "two"]}', 2),
+            ["one", "two"],
+        )
+
+    def test_fenced_json(self):
+        reply = '```json\n{"summaries": ["a"]}\n```'
+        self.assertEqual(parse_summaries(reply, 1), ["a"])
+
+    def test_wrong_length_raises(self):
+        with self.assertRaises(ValueError):
+            parse_summaries('{"summaries": ["only-one"]}', 2)
+
+
+class RateLimitTests(unittest.TestCase):
+    def test_mistral_429_body(self):
+        err = Exception(
+            'API error occurred: Status 429. Body: {"type":"rate_limited","code":"1300"}'
+        )
+        self.assertTrue(is_rate_limited(err))
+
+    def test_other_errors_not_rate_limits(self):
+        self.assertFalse(is_rate_limited(Exception("timeout connecting to api")))
 
 
 if __name__ == "__main__":

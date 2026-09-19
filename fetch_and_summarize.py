@@ -53,9 +53,14 @@ REQUIRED_ENV = ("MISTRAL_API_KEY", "GMAIL_USER", "GMAIL_APP_PASSWORD", "GMAIL_TO
 ARTICLES_PER_FEED = 4
 MAX_ENTRY_AGE_DAYS = 3  # ignore entries older than this, see entry_is_fresh
 MAX_STORY_CHARS = 1500  # cap per-story text sent to the model
-MISTRAL_MODEL = "mistral-small-latest"
+# pin the ids from the org limits page - mistral-small-latest is not listed
+MISTRAL_MODEL = "mistral-small-2603"
 # duplicate spotting is harder than summarizing, so it gets a bigger model
 DUP_MODEL = "mistral-medium-latest"
+# both of those models are capped at 1 request/second on this workspace.
+# burst the daily job and every call 429s; space them and retry slowly.
+MIN_REQUEST_GAP = 1.25
+RATE_LIMIT_RETRIES = 4
 HTTP_TIMEOUT = 15
 # some news sites 403 requests without a browser-like user agent
 USER_AGENT = (
@@ -237,6 +242,50 @@ def build_client():
     return Mistral(api_key=api_key)
 
 
+_last_request_at = 0.0
+
+
+def is_rate_limited(exc):
+    text = str(exc).lower()
+    return "429" in text or "rate_limited" in text or "rate limit" in text
+
+
+def chat_complete(client, model, messages):
+    """One chat call, throttled to the org's ~1 rps cap.
+
+    On 429 wait 2, 4, 8, 16 seconds rather than retrying immediately,
+    which is what used to burn the rest of the run.
+    """
+    global _last_request_at
+    last_err = None
+    for attempt in range(RATE_LIMIT_RETRIES + 1):
+        wait = MIN_REQUEST_GAP - (time.monotonic() - _last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            _last_request_at = time.monotonic()
+            return client.chat.complete(
+                model=model,
+                messages=messages,
+            )
+        except Exception as e:
+            last_err = e
+            if not is_rate_limited(e) or attempt == RATE_LIMIT_RETRIES:
+                raise
+            sleep_s = 2 ** (attempt + 1)
+            print(f"[warn] {model} rate-limited, waiting {sleep_s}s "
+                  f"(attempt {attempt + 1}/{RATE_LIMIT_RETRIES})")
+            time.sleep(sleep_s)
+    raise last_err
+
+
+def strip_json_fence(text):
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-z]*\s*|\s*```$", "", text, flags=re.S).strip()
+    return text
+
+
 def clean_summary(text):
     """Models sometimes ignore formatting instructions - strip any
     markdown bold markers and a leading 'Summary:' label."""
@@ -244,6 +293,26 @@ def clean_summary(text):
     if text.lower().startswith("summary:"):
         text = text[len("summary:"):].strip()
     return text
+
+
+def fallback_summary(article):
+    return clean_summary(article["description"][:300] or "(no summary available)")
+
+
+def parse_summaries(reply, count):
+    """Read a batched summarization reply into `count` plain strings."""
+    payload = json.loads(strip_json_fence(reply))
+    if not isinstance(payload, dict) or not isinstance(payload.get("summaries"), list):
+        raise ValueError(f"expected an object with a 'summaries' list, got {payload!r}")
+    items = payload["summaries"]
+    if len(items) != count:
+        raise ValueError(f"expected {count} summaries, got {len(items)}")
+    texts = []
+    for item in items:
+        if not isinstance(item, str):
+            raise ValueError(f"summary is not a string: {item!r}")
+        texts.append(item)
+    return texts
 
 
 def summarize(client, article):
@@ -256,15 +325,56 @@ def summarize(client, article):
         f"Description: {article['description']}"
     )
     try:
-        resp = client.chat.complete(
-            model=MISTRAL_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+        resp = chat_complete(
+            client,
+            MISTRAL_MODEL,
+            [{"role": "user", "content": prompt}],
         )
         text = resp.choices[0].message.content
     except Exception as e:
         print(f"[warn] summarization failed for '{article['title']}': {e}")
-        text = article["description"][:300] or "(no summary available)"
-    return clean_summary(text)
+        return fallback_summary(article)
+    return clean_summary(text) or fallback_summary(article)
+
+
+def summarize_all(client, articles):
+    """One request for the whole harvest, then one request per story
+    only for any slot the batch left empty. Cuts a 1 rps quota to two
+    calls on a good day instead of one per article."""
+    if not articles:
+        return []
+    listing = "\n\n".join(
+        f"{i}. Title: {a['title']}\nDescription: {a['description']}"
+        for i, a in enumerate(articles, 1)
+    )
+    prompt = (
+        f"Summarize each of these {len(articles)} AI news items in 2 concise "
+        "sentences. Plain text only: no markdown, no headings, no "
+        "'Summary:' label. Answer with JSON and nothing else, in exactly "
+        'this shape: {"summaries": ["...", "..."]}\n'
+        "The list must have one string per item, in the same order.\n\n"
+        + listing
+    )
+    texts = None
+    try:
+        resp = chat_complete(
+            client,
+            MISTRAL_MODEL,
+            [{"role": "user", "content": prompt}],
+        )
+        texts = parse_summaries(resp.choices[0].message.content, len(articles))
+    except Exception as e:
+        print(f"[warn] batched summarization failed: {e}")
+
+    summaries = []
+    for i, article in enumerate(articles):
+        text = ""
+        if texts is not None:
+            text = clean_summary(texts[i])
+        if not text:
+            text = summarize(client, article)
+        summaries.append(text)
+    return summaries
 
 
 SIG_DESC_CHARS = 200  # description prefix that feeds a story signature
@@ -367,9 +477,7 @@ def parse_duplicate_groups(reply, count):
     every member of a group, taking the story out altogether.
     Raises ValueError on anything malformed so the caller can retry.
     """
-    text = reply.strip()
-    if text.startswith("```"):  # models like to fence their json
-        text = re.sub(r"^```[a-z]*\s*|\s*```$", "", text, flags=re.S).strip()
+    text = strip_json_fence(reply)
     payload = json.loads(text)
     if not isinstance(payload, dict) or not isinstance(payload.get("groups"), list):
         raise ValueError(f"expected an object with a 'groups' list, got {payload!r}")
@@ -416,9 +524,10 @@ def llm_duplicates(client, articles):
     reply = ""
     for attempt in range(DUP_RETRIES + 1):
         try:
-            resp = client.chat.complete(
-                model=DUP_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+            resp = chat_complete(
+                client,
+                DUP_MODEL,
+                [{"role": "user", "content": prompt}],
             )
             reply = resp.choices[0].message.content or ""
             groups = parse_duplicate_groups(reply, len(articles))
@@ -427,7 +536,8 @@ def llm_duplicates(client, articles):
             print(f"[warn] duplicate check attempt {attempt + 1} failed: {e}")
             if reply:
                 print(f"[warn] raw reply was: {reply!r}")
-            if attempt == DUP_RETRIES:
+            # chat_complete already waited out 429s; don't hammer again
+            if is_rate_limited(e) or attempt == DUP_RETRIES:
                 print("[warn] duplicate check gave up, keeping every story")
                 return {}
             time.sleep(2 ** attempt)
@@ -584,8 +694,9 @@ if __name__ == "__main__":
         print("nothing new today, no email sent")
         sys.exit()
 
-    for a in fresh:
-        a["summary"] = summarize(client, a)
+    summaries = summarize_all(client, fresh)
+    for a, summary in zip(fresh, summaries):
+        a["summary"] = summary
 
     send_email(build_html(fresh))
     # only remember articles after the send succeeded, so a failed

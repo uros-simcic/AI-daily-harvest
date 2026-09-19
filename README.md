@@ -27,9 +27,11 @@ no server needed.
    already supports. The first listed copy of a story is the one kept.
    If the check fails nothing is dropped, and a pass that would delete
    half the harvest is thrown out rather than mail a near-empty email.
-4. **Summarize** — one Mistral call per surviving article turns title +
-   feed description into a two-sentence summary. If a call fails, the
-   feed's own description is used instead.
+4. **Summarize** — one Mistral call for the whole harvest (not one per
+   article) turns title + feed description into two-sentence summaries.
+   Calls are spaced to stay under the workspace's 1 request/second cap;
+   a 429 waits and retries instead of burning the rest of the run. If
+   the model never answers, the feed's own description is used instead.
 5. **Send** — a single email via Gmail. Each entry is a clickable source
    label followed by the summary. Recipients are BCC'd, so a small
    subscriber list works out of the box.
