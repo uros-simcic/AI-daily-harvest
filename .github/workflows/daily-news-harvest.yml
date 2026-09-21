@@ -2,9 +2,9 @@ name: Daily News Harvest
 
 on:
   schedule:
-    # 07:00 UTC daily. github cron is best-effort - runs can start
-    # up to a few hours late at busy times, nothing to fix here
-    - cron: "0 7 * * *"
+    # 07:17 UTC daily. Off the hour so GitHub is less likely to drop
+    # the run. Cron is still best-effort and can start late.
+    - cron: "17 7 * * *"
   # manual runs from the actions tab, for testing
   workflow_dispatch: {}
 
