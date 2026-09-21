@@ -65,7 +65,7 @@ sent articles are remembered in `seen_titles.txt`.
 ## Daily schedule
 
 The workflow in `.github/workflows/daily-news-harvest.yml` runs every day
-at 07:00 UTC (GitHub cron is best-effort, so the actual start can drift).
+at 07:17 UTC (GitHub cron is best-effort, so the actual start can drift).
 Add the same four variables as repository secrets under
 *Settings → Secrets and variables → Actions*, then trigger a first run
 manually from the *Actions* tab to check everything works.
