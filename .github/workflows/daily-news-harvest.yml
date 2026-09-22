@@ -2,9 +2,10 @@ name: Daily News Harvest
 
 on:
   schedule:
-    # 07:17 UTC daily. Off the hour so GitHub is less likely to drop
-    # the run. Cron is still best-effort and can start late.
-    - cron: "17 7 * * *"
+    # 07:19 UTC. Earlier than 09:00, off the hour. The minute is
+    # different from 07:17 on purpose: GitHub only rebinds the
+    # schedule actor when the cron string itself changes.
+    - cron: "19 7 * * *"
   # manual runs from the actions tab, for testing
   workflow_dispatch: {}
 
