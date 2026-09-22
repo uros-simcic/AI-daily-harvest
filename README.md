@@ -66,6 +66,9 @@ sent articles are remembered in `seen_titles.txt`.
 
 The workflow in `.github/workflows/daily-news-harvest.yml` runs every day
 at 07:19 UTC (GitHub cron is best-effort, so the actual start can drift).
+Changes to that workflow file must land as a merge commit by the repo
+owner. Squash or a GitHub App merge rebinds the schedule actor and
+the daily job stops.
 Add the same four variables as repository secrets under
 *Settings → Secrets and variables → Actions*, then trigger a first run
 manually from the *Actions* tab to check everything works.
