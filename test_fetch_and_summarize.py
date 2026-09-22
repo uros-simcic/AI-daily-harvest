@@ -4,6 +4,8 @@
 import unittest
 
 from fetch_and_summarize import (
+    DUP_MODEL,
+    MIN_REQUEST_GAP,
     is_rate_limited,
     looks_like_feed,
     parse_summaries,
@@ -94,6 +96,12 @@ class RateLimitTests(unittest.TestCase):
 
     def test_other_errors_not_rate_limits(self):
         self.assertFalse(is_rate_limited(Exception("timeout connecting to api")))
+
+    def test_gap_clears_one_request_per_second(self):
+        self.assertGreaterEqual(MIN_REQUEST_GAP, 2.0)
+
+    def test_duplicate_model_is_pinned(self):
+        self.assertFalse(DUP_MODEL.endswith("-latest"))
 
 
 if __name__ == "__main__":
