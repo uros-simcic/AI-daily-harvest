@@ -66,9 +66,7 @@ sent articles are remembered in `seen_titles.txt`.
 ## Daily schedule
 
 The workflow in `.github/workflows/daily-news-harvest.yml` runs every day
-at 07:19 UTC, with a backup at 15:19 UTC if GitHub drops the morning
-slot (cron is best-effort, so the actual start can drift). Already
-mailed titles are skipped, so the backup does not double-send.
+at 07:19 UTC (GitHub cron is best-effort, so the actual start can drift).
 Changes to that workflow file must land as a merge commit by the repo
 owner. Squash or a GitHub App merge rebinds the schedule actor and
 the daily job stops.

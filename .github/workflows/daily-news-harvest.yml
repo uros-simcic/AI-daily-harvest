@@ -2,14 +2,12 @@ name: Daily News Harvest
 
 on:
   schedule:
-    # 07:19 UTC, plus 15:19 UTC if GitHub drops the morning slot.
-    # seen_titles.txt makes the backup a no-op after a successful
-    # morning send. Last merge-commit on this file sets the
-    # schedule actor. A GitHub App squash-merge sets the actor to
-    # the app and scheduled runs stop. Merge this file as a merge
-    # commit, logged in as the repo owner. Never squash.
+    # 07:19 UTC, off the hour.
+    # Last merge-commit on this cron line sets the schedule actor.
+    # A GitHub App squash-merge sets the actor to the app and
+    # scheduled runs stop. Merge this file as a merge commit,
+    # logged in as the repo owner. Never squash.
     - cron: "19 7 * * *"
-    - cron: "19 15 * * *"
   # manual runs from the actions tab, for testing
   workflow_dispatch: {}
 
