@@ -29,9 +29,10 @@ no server needed.
    half the harvest is thrown out rather than mail a near-empty email.
 4. **Summarize** — one Mistral call for the whole harvest (not one per
    article) turns title + feed description into two-sentence summaries.
-   Calls are spaced to stay under the workspace's 1 request/second cap;
-   a 429 waits and retries instead of burning the rest of the run. If
-   the model never answers, the feed's own description is used instead.
+   Calls are spaced two seconds apart to stay under the workspace's
+   1 request/second cap; a 429 waits and retries instead of burning
+   the rest of the run. If the model never answers, the feed's own
+   description is used instead.
 5. **Send** — a single email via Gmail. Each entry is a clickable source
    label followed by the summary. Recipients are BCC'd, so a small
    subscriber list works out of the box.
@@ -65,7 +66,9 @@ sent articles are remembered in `seen_titles.txt`.
 ## Daily schedule
 
 The workflow in `.github/workflows/daily-news-harvest.yml` runs every day
-at 07:19 UTC (GitHub cron is best-effort, so the actual start can drift).
+at 07:19 UTC, with a backup at 15:19 UTC if GitHub drops the morning
+slot (cron is best-effort, so the actual start can drift). Already
+mailed titles are skipped, so the backup does not double-send.
 Changes to that workflow file must land as a merge commit by the repo
 owner. Squash or a GitHub App merge rebinds the schedule actor and
 the daily job stops.

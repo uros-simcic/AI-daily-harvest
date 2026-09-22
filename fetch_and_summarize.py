@@ -55,11 +55,12 @@ MAX_ENTRY_AGE_DAYS = 3  # ignore entries older than this, see entry_is_fresh
 MAX_STORY_CHARS = 1500  # cap per-story text sent to the model
 # pin the ids from the org limits page - mistral-small-latest is not listed
 MISTRAL_MODEL = "mistral-small-2603"
-# duplicate spotting is harder than summarizing, so it gets a bigger model
-DUP_MODEL = "mistral-medium-latest"
+# duplicate spotting is harder than summarizing, so it gets a bigger model.
+# pin a versioned id, not mistral-medium-latest (alias, can retarget)
+DUP_MODEL = "mistral-medium-3-5"
 # both of those models are capped at 1 request/second on this workspace.
 # burst the daily job and every call 429s; space them and retry slowly.
-MIN_REQUEST_GAP = 1.25
+MIN_REQUEST_GAP = 2.0
 RATE_LIMIT_RETRIES = 4
 HTTP_TIMEOUT = 15
 # some news sites 403 requests without a browser-like user agent
