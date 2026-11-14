@@ -188,8 +188,8 @@ class HarvestEntryPointTests(unittest.TestCase):
         """Run the real script using fake feeds/provider/mail and isolated state."""
         script = Path(harvest.__file__).resolve()
         articles = [
-            ("Alpha inference memory research", "A supported source about inference memory."),
-            ("Beta robot actuator release", "A different source about robot actuators."),
+            ("Alpha inference memory research", "A supported source about inference memory. " * 20),
+            ("Beta robot actuator release", "A different source about robot actuators. " * 20),
         ]
         rss = ("<rss version='2.0'><channel>" + "".join(
             f"<item><title>{title}</title>"
@@ -208,8 +208,12 @@ class HarvestEntryPointTests(unittest.TestCase):
         provider = Mock()
         generation_replies = Mock(side_effect=replies)
 
-        def respond(*, model, messages):
-            if model == harvest.DUP_MODEL:
+        def respond(*, model, messages, max_tokens):
+            self.assertEqual(max_tokens, 2048)
+            if messages[0]["content"] == harvest.GROUNDING_INSTRUCTIONS:
+                count = len(json.loads(messages[1]["content"]))
+                return completion(json.dumps({"supported": [True] * count}))
+            if messages[0]["content"] != harvest.TAKEAWAY_INSTRUCTIONS:
                 return completion('{"groups": []}')
             return generation_replies()
 
@@ -302,6 +306,67 @@ class HarvestEntryPointTests(unittest.TestCase):
             )),
         ])
         self.assertEqual(calls, 1)
+
+
+class GroundingTests(unittest.TestCase):
+    def test_rejected_and_skipped_items_keep_alignment(self):
+        articles = [{"title": "Test", "description": "Source"}] * 3
+        with patch.object(harvest, "chat_complete", return_value=completion(
+                '{"supported": [false, true]}')):
+            self.assertEqual(harvest.validate_takeaways(
+                Mock(), articles, ["Unsupported", None, "Supported"]),
+                [None, None, "Supported"])
+
+    def test_no_candidates_avoids_provider_call(self):
+        with patch.object(harvest, "chat_complete") as call:
+            self.assertEqual(harvest.validate_takeaways(
+                Mock(), [{"title": "Test", "description": "Source"}], [None]), [None])
+            call.assert_not_called()
+
+    def test_malformed_verdicts_stop_delivery(self):
+        for reply in ('{}', '{"supported": []}', '{"supported": ["true"]}', 'bad'):
+            with self.subTest(reply=reply), patch.object(
+                    harvest, "chat_complete", return_value=completion(reply)):
+                with self.assertRaisesRegex(RuntimeError, "digest was not sent"):
+                    harvest.validate_takeaways(Mock(),
+                        [{"title": "Test", "description": "Source"}], ["Lesson"])
+
+
+class SourceEvidenceTests(unittest.TestCase):
+    def test_article_parser_excludes_navigation_and_scripts(self):
+        parser = harvest.ArticleTextParser()
+        parser.feed('<nav><p>Wrong</p></nav><div class="entry-content"><p>Evidence '
+                    '<strong>here</strong>.</p><script>Bad</script></div><p>Outside</p>')
+        self.assertEqual(" ".join("".join(parser.parts).split()), "Evidence here.")
+
+    def test_rejects_invented_chip_and_benchmark(self):
+        article = {"title": "GPU study", "description": "Blackwell trained the models."}
+        self.assertTrue(harvest.has_unsupported_identifiers("It used A100 chips.", article))
+        self.assertTrue(harvest.has_unsupported_identifiers("It was 19% faster.", article))
+        self.assertFalse(harvest.has_unsupported_identifiers("Blackwell was used.", article))
+
+    def test_preserves_supported_number(self):
+        self.assertFalse(harvest.has_unsupported_identifiers("It was 19% faster.",
+            {"title": "Study", "description": "The model was 19% faster."}))
+
+    def test_unavailable_thin_article_is_skipped(self):
+        article = {"source": "TechCrunch AI", "title": "Study",
+                   "url": "https://techcrunch.com/study", "description": "Thin source"}
+        with patch.object(harvest.requests, "get", side_effect=harvest.requests.ConnectionError):
+            self.assertEqual(harvest.enrich_sources([article]), [])
+
+    def test_long_feed_avoids_article_request(self):
+        article = {"source": "TechCrunch AI", "title": "Study",
+                   "url": "https://techcrunch.com/study", "description": "Evidence " * 100}
+        with patch.object(harvest.requests, "get") as request:
+            self.assertEqual(harvest.enrich_sources([article]), [article])
+            request.assert_not_called()
+
+    def test_numeric_rejection_precedes_ai_check(self):
+        with patch.object(harvest, "chat_complete") as request:
+            self.assertEqual(harvest.validate_takeaways(Mock(),
+                [{"title": "Study", "description": "No figures supplied"}], ["19% faster"]), [None])
+            request.assert_not_called()
 
 
 if __name__ == "__main__":
