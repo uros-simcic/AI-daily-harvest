@@ -53,14 +53,12 @@ REQUIRED_ENV = ("MISTRAL_API_KEY", "GMAIL_USER", "GMAIL_APP_PASSWORD", "GMAIL_TO
 ARTICLES_PER_FEED = 4
 MAX_ENTRY_AGE_DAYS = 3  # ignore entries older than this, see entry_is_fresh
 MAX_STORY_CHARS = 1500  # cap per-story text sent to the model
-# pin the ids from the org limits page - mistral-small-latest is not listed
-MISTRAL_MODEL = "mistral-small-2603"
-# duplicate spotting is harder than summarizing, so it gets a bigger model.
-# pin a versioned id, not mistral-medium-latest (alias, can retarget)
-DUP_MODEL = "mistral-medium-3-5"
-# both of those models are capped at 1 request/second on this workspace.
-# burst the daily job and every call 429s; space them and retry slowly.
-MIN_REQUEST_GAP = 2.0
+# This versioned model accepted a live request with the free account.
+MISTRAL_MODEL = "ministral-14b-2512"
+# Use the same accessible model for duplicate detection.
+DUP_MODEL = "ministral-14b-2512"
+# The console lists 0.03 requests/second; leave at least 35 seconds.
+MIN_REQUEST_GAP = 35.0
 RATE_LIMIT_RETRIES = 4
 HTTP_TIMEOUT = 15
 # some news sites 403 requests without a browser-like user agent
@@ -252,7 +250,7 @@ def is_rate_limited(exc):
 
 
 def chat_complete(client, model, messages):
-    """One chat call, throttled to the org's ~1 rps cap.
+    """One chat call, spaced for the model's free-account request limit.
 
     On 429 wait 2, 4, 8, 16 seconds rather than retrying immediately,
     which is what used to burn the rest of the run.
@@ -268,6 +266,7 @@ def chat_complete(client, model, messages):
             return client.chat.complete(
                 model=model,
                 messages=messages,
+                max_tokens=2048,
             )
         except Exception as e:
             last_err = e

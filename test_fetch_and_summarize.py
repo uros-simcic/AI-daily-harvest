@@ -208,8 +208,9 @@ class HarvestEntryPointTests(unittest.TestCase):
         provider = Mock()
         generation_replies = Mock(side_effect=replies)
 
-        def respond(*, model, messages):
-            if model == harvest.DUP_MODEL:
+        def respond(*, model, messages, max_tokens):
+            self.assertEqual(max_tokens, 2048)
+            if messages[0]["content"] != harvest.TAKEAWAY_INSTRUCTIONS:
                 return completion('{"groups": []}')
             return generation_replies()
 
