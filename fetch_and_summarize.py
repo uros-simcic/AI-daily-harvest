@@ -12,6 +12,7 @@ import sys
 import time
 from datetime import date
 from email.mime.text import MIMEText
+from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlparse
 
 import feedparser
@@ -52,7 +53,7 @@ REQUIRED_ENV = ("MISTRAL_API_KEY", "GMAIL_USER", "GMAIL_APP_PASSWORD", "GMAIL_TO
 
 ARTICLES_PER_FEED = 4
 MAX_ENTRY_AGE_DAYS = 3  # ignore entries older than this, see entry_is_fresh
-MAX_STORY_CHARS = 1500  # cap per-story text sent to the model
+MAX_STORY_CHARS = 4000  # cap per-story text sent to the model
 # This versioned model accepted a live request with the free account.
 MISTRAL_MODEL = "ministral-14b-2512"
 # Use the same accessible model for duplicate detection.
@@ -295,6 +296,86 @@ def clean_summary(text):
     return text
 
 
+# Short RSS blurbs rarely contain enough evidence for a useful lesson.
+MIN_SOURCE_WORDS = 80
+ARTICLE_MAX_BYTES = 1_000_000
+
+
+class ArticleTextParser(HTMLParser):
+    """Read article paragraphs; exclude scripts and page navigation."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []
+        self.root = None
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"area", "base", "br", "col", "embed", "hr", "img", "input",
+                   "link", "meta", "param", "source", "track", "wbr"}:
+            return
+        self.stack.append(tag)
+        classes = dict(attrs).get("class", "").split()
+        if self.root is None and (tag == "article" or
+                {"entry-content", "article-content", "wp-block-post-content"}.intersection(classes)):
+            self.root = len(self.stack)
+
+    def handle_endtag(self, tag):
+        if tag in self.stack:
+            index = len(self.stack) - 1 - self.stack[::-1].index(tag)
+            if self.root is not None and index < self.root:
+                self.root = None
+            del self.stack[index:]
+        if tag in {"p", "li", "h2", "h3"}:
+            self.parts.append(" ")
+
+    def handle_data(self, text):
+        if (self.root is not None and {"p", "li", "h2", "h3"}.intersection(self.stack)
+                and not {"script", "style", "nav", "footer", "aside"}.intersection(self.stack)):
+            self.parts.append(text)
+
+
+def enrich_sources(articles):
+    """Fetch fuller evidence for thin feeds; skip if it remains unavailable."""
+    enriched = []
+    for article in articles:
+        description = article["description"][:MAX_STORY_CHARS]
+        if len(description.split()) < MIN_SOURCE_WORDS:
+            domains = FEEDS[article["source"]]["domains"]
+            if not safe_link(article["url"], domains):
+                continue
+            try:
+                with requests.get(article["url"], timeout=HTTP_TIMEOUT,
+                        headers={"User-Agent": USER_AGENT}, stream=True,
+                        allow_redirects=False) as response:
+                    if response.status_code != 200 or "text/html" not in response.headers.get("content-type", "").lower():
+                        continue
+                    body = bytearray()
+                    for chunk in response.iter_content(65536):
+                        body.extend(chunk)
+                        if len(body) > ARTICLE_MAX_BYTES:
+                            break
+                    if len(body) > ARTICLE_MAX_BYTES:
+                        continue
+                    parser = ArticleTextParser()
+                    parser.feed(body.decode(response.encoding or "utf-8", errors="replace"))
+                    description = " ".join("".join(parser.parts).split())[:MAX_STORY_CHARS]
+            except (requests.RequestException, UnicodeError, LookupError):
+                continue
+        if len(description.split()) >= MIN_SOURCE_WORDS:
+            enriched.append({**article, "description": description})
+    print(f"[info] skipped {len(articles) - len(enriched)} item(s) without sufficient source text")
+    return enriched
+
+
+def has_unsupported_identifiers(text, article):
+    """Reject invented numbers and alphanumeric model/chip identifiers."""
+    source = article["title"] + " " + article["description"][:MAX_STORY_CHARS]
+    tokens = re.findall(r"\b[\w]+(?:[.%-][\w]+)*%?", text, flags=re.UNICODE)
+    return any(any(c.isdigit() for c in token) and not re.search(
+        r"(?<!\w)" + re.escape(token) + r"(?!\w)", source, flags=re.IGNORECASE)
+        for token in tokens)
+
+
 TAKEAWAY_INSTRUCTIONS = (
     "For each AI item, teach one concrete point in at most two short sentences. "
     "Explain a mechanism, useful distinction, implication, or limitation "
@@ -352,6 +433,8 @@ GROUNDING_INSTRUCTIONS = (
 
 
 def validate_takeaways(client, articles, summaries):
+    summaries = [text if text is None or not has_unsupported_identifiers(text, article)
+                 else None for article, text in zip(articles, summaries)]
     candidates = [
         {"title": article["title"],
          "description": article["description"][:MAX_STORY_CHARS],
@@ -725,6 +808,9 @@ if __name__ == "__main__":
         print("nothing new today, no email sent")
         sys.exit()
 
+    fresh = enrich_sources(fresh)
+    if not fresh:
+        sys.exit("no eligible source text; no email sent")
     client = build_client()
     summaries = summarize_all(client, fresh)
     summaries = validate_takeaways(client, fresh, summaries)
