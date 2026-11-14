@@ -50,4 +50,39 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           GMAIL_TO: ${{ secrets.GMAIL_TO }}
-        run: python fetch_and_summarize.py
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import requests
+          
+          try:
+              response = requests.post(
+                  "https://api.mistral.ai/v1/chat/completions",
+                  headers={
+                      "Authorization": "Bearer " + os.environ["MISTRAL_API_KEY"]
+                  },
+                  json={
+                      "model": "mistral-small-2603",
+                      "messages": [{"role": "user", "content": "Reply OK."}],
+                      "max_tokens": 32,
+                  },
+                  timeout=30,
+              )
+          except requests.RequestException:
+              sys.exit("Diagnostic transport failure; no email sent")
+          
+          print("HTTP status:", response.status_code)
+          try:
+              data = response.json()
+          except ValueError:
+              sys.exit("Non-JSON response; no email sent")
+          if not isinstance(data, dict):
+              sys.exit("Unexpected response; no email sent")
+          
+          code = data.get("code")
+          print("Provider code:", code if isinstance(code, int) else "unavailable")
+          succeeded = response.ok and bool(data.get("choices"))
+          print("Tiny completion succeeded:", succeeded)
+          sys.exit(0 if succeeded else 1)
+          PY
