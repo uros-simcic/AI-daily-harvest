@@ -108,7 +108,7 @@ class SummaryParseTests(unittest.TestCase):
     def test_invalid_items_and_overlong_takeaways_are_rejected(self):
         cases = [None, [], {}, {"status": "skip", "reason": "other"},
                  {"status": "keep", "takeaway": "**"},
-                 {"status": "keep", "takeaway": "word " * 56}]
+                 {"status": "keep", "takeaway": "word " * 29}]
         for item in cases:
             with self.subTest(item=item):
                 with self.assertRaises(ValueError):

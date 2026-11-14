@@ -29,10 +29,10 @@ no server needed.
    If the check fails nothing is dropped, and a pass that would delete
    half the harvest is thrown out rather than mail a near-empty email.
 4. **Teach** — Mistral turns each supported source into a concrete teaching
-   point in at most two short sentences. Promotions and sources too thin
+   point in one short sentence of at most 28 words. Promotions and sources too thin
    to support a useful explanation are excluded. Eligible stories then
    pass through the duplicate checks above before sending.
-   Calls retain the existing two-second spacing and bounded 429 retries.
+   Calls retain the 35-second spacing and bounded 429 retries.
    Persistent batch rate limiting stops the run without individual calls.
    Other unusable batch responses may be retried per item. Any generation
    failure stops the digest before sending or saving article history;
@@ -99,4 +99,4 @@ video, one email every Sunday.
 
 ## Preview without sending
 
-Select the manual workflow preview input to generate takeaways without SMTP or updating sent history. Locally, set HARVEST_PREVIEW=1; only MISTRAL_API_KEY is required. Preview HTML appears in workflow output. A provider failure stops the run instead of substituting feed descriptions. Takeaways are limited to 55 words and must be grounded in the supplied source; unsuitable items are skipped.
+Select the manual workflow preview input to generate takeaways without SMTP or updating sent history. Locally, set HARVEST_PREVIEW=1; only MISTRAL_API_KEY is required. Preview HTML appears in workflow output. A provider failure stops the run instead of substituting feed descriptions. Takeaways are limited to 28 words and must be grounded in the supplied source; unsuitable items are skipped.
