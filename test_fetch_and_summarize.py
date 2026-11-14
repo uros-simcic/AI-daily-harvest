@@ -210,6 +210,9 @@ class HarvestEntryPointTests(unittest.TestCase):
 
         def respond(*, model, messages, max_tokens):
             self.assertEqual(max_tokens, 2048)
+            if messages[0]["content"] == harvest.GROUNDING_INSTRUCTIONS:
+                count = len(json.loads(messages[1]["content"]))
+                return completion(json.dumps({"supported": [True] * count}))
             if messages[0]["content"] != harvest.TAKEAWAY_INSTRUCTIONS:
                 return completion('{"groups": []}')
             return generation_replies()
@@ -303,6 +306,30 @@ class HarvestEntryPointTests(unittest.TestCase):
             )),
         ])
         self.assertEqual(calls, 1)
+
+
+class GroundingTests(unittest.TestCase):
+    def test_rejected_and_skipped_items_keep_alignment(self):
+        articles = [{"title": "Test", "description": "Source"}] * 3
+        with patch.object(harvest, "chat_complete", return_value=completion(
+                '{"supported": [false, true]}')):
+            self.assertEqual(harvest.validate_takeaways(
+                Mock(), articles, ["Unsupported", None, "Supported"]),
+                [None, None, "Supported"])
+
+    def test_no_candidates_avoids_provider_call(self):
+        with patch.object(harvest, "chat_complete") as call:
+            self.assertEqual(harvest.validate_takeaways(
+                Mock(), [{"title": "Test", "description": "Source"}], [None]), [None])
+            call.assert_not_called()
+
+    def test_malformed_verdicts_stop_delivery(self):
+        for reply in ('{}', '{"supported": []}', '{"supported": ["true"]}', 'bad'):
+            with self.subTest(reply=reply), patch.object(
+                    harvest, "chat_complete", return_value=completion(reply)):
+                with self.assertRaisesRegex(RuntimeError, "digest was not sent"):
+                    harvest.validate_takeaways(Mock(),
+                        [{"title": "Test", "description": "Source"}], ["Lesson"])
 
 
 if __name__ == "__main__":
