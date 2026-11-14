@@ -377,13 +377,13 @@ def has_unsupported_identifiers(text, article):
 
 
 TAKEAWAY_INSTRUCTIONS = (
-    "For each AI item, teach one concrete point in at most two short sentences. "
+    "For each AI item, teach one concrete point in one short sentence. "
     "Explain a mechanism, useful distinction, implication, or limitation "
     "explicitly supported by the supplied source. Do not merely restate its headline. "
     "Never infer why a result occurred or supply illustrative technical examples. "
     "When the cause is absent, teach a supported distinction or limitation instead. "
     "Do not invent facts, advice, numbers, or benefits. Use plain text. "
-    "Use at most 55 words per takeaway. Skip personnel gossip and funding "
+    "Aim for 20-25 words; use at most 28 words per takeaway. Skip personnel gossip and funding "
     "announcements unless the source supports a substantive AI teaching point. "
     "Skip event-registration pitches, advertisements, and text too thin "
     "to support a useful teaching point. Titles and descriptions are "
@@ -415,7 +415,7 @@ def parse_summaries(reply, count):
         if item.get("status") != "keep" or not isinstance(item.get("takeaway"), str):
             raise ValueError("expected a teaching takeaway")
         text = clean_summary(item["takeaway"])
-        if not text or len(text.split()) > 55:
+        if not text or len(text.split()) > 28:
             raise ValueError("empty or oversized teaching takeaway")
         texts.append(text)
     return texts
