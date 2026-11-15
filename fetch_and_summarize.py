@@ -782,9 +782,28 @@ def send_email(html_body):
     msg["From"] = user
     msg["To"] = user  # real recipients are bcc'd
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
-        server.login(user, os.environ["GMAIL_APP_PASSWORD"])
-        server.sendmail(user, recipients, msg.as_string())
+    if not recipients:
+        raise RuntimeError("smtp_not_sent: recipient list is empty")
+    send_started = False
+    outcome = None
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+            server.login(user, os.environ["GMAIL_APP_PASSWORD"])
+            send_started = True
+            refused = server.sendmail(user, recipients, msg.as_string())
+            outcome = (len(recipients) - len(refused), len(refused))
+    except smtplib.SMTPRecipientsRefused:
+        raise RuntimeError("smtp_rejected: all recipients refused") from None
+    except (smtplib.SMTPSenderRefused, smtplib.SMTPDataError):
+        raise RuntimeError("smtp_rejected: server rejected the message") from None
+    except OSError:
+        if outcome is None:
+            status = "smtp_uncertain" if send_started else "smtp_not_sent"
+            raise RuntimeError(
+                f"{status}: no confirmed acceptance; no immediate retry"
+            ) from None
+        print("::warning::SMTP connection cleanup failed after confirmed acceptance")
+    return outcome
 
 
 if __name__ == "__main__":
@@ -836,8 +855,12 @@ if __name__ == "__main__":
         print(f"preview_only: {len(fresh)} takeaways; no email or history update")
         sys.exit()
 
-    send_email(build_html(fresh))
-    # only remember articles after the send succeeded, so a failed
-    # run retries them tomorrow instead of losing them
+    accepted, refused = send_email(build_html(fresh))
+    # Preserve current history behavior after at least one SMTP acceptance.
+    # Partial refusals need recipient-specific recovery, not a replay to everyone.
     save_seen(seen + [title_key(a["title"]) for a in candidates])
-    print(f"sent {len(fresh)} articles")
+    if refused:
+        print(f"::warning::partial_delivery: SMTP accepted {accepted} recipient(s), "
+              f"refused {refused}; articles remembered; do not replay to accepted recipients")
+    else:
+        print(f"sent {len(fresh)} articles; SMTP accepted {accepted} recipient(s)")

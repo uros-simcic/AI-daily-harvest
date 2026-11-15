@@ -184,7 +184,7 @@ class GenerationFailureTests(unittest.TestCase):
 
 
 class HarvestEntryPointTests(unittest.TestCase):
-    def run_harvest(self, replies, error=None, preview=False, all_skipped=False):
+    def run_harvest(self, replies, error=None, preview=False, all_skipped=False, partial=False):
         """Run the real script using fake feeds/provider/mail and isolated state."""
         script = Path(harvest.__file__).resolve()
         articles = [
@@ -230,7 +230,8 @@ class HarvestEntryPointTests(unittest.TestCase):
                         "MISTRAL_API_KEY": "test-only",
                         "GMAIL_USER": "sender@example.invalid",
                         "GMAIL_APP_PASSWORD": "test-only",
-                        "GMAIL_TO": "recipient@example.invalid",
+                        "GMAIL_TO": ("recipient@example.invalid,rejected@example.invalid"
+                                     if partial else "recipient@example.invalid"),
                         "HARVEST_PREVIEW": "1" if preview else "0",
                     }, clear=True))
                     stack.enter_context(patch("dotenv.load_dotenv"))
@@ -238,7 +239,10 @@ class HarvestEntryPointTests(unittest.TestCase):
                     stack.enter_context(patch("mistralai.client.Mistral", return_value=provider))
                     stack.enter_context(patch("time.sleep"))
                     smtp = stack.enter_context(patch("smtplib.SMTP_SSL"))
-                    stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                    smtp.return_value.__enter__.return_value.sendmail.return_value = (
+                        {"rejected@example.invalid": (550, b"refused")} if partial else {})
+                    printed = io.StringIO()
+                    stack.enter_context(contextlib.redirect_stdout(printed))
                     if error:
                         with self.assertRaisesRegex(RuntimeError, error):
                             runpy.run_path(str(script), run_name="__main__")
@@ -255,6 +259,9 @@ class HarvestEntryPointTests(unittest.TestCase):
                         runpy.run_path(str(script), run_name="__main__")
                         mail = smtp.return_value.__enter__.return_value
                         mail.sendmail.assert_called_once()
+                        if partial:
+                            self.assertIn("partial_delivery", printed.getvalue())
+                            self.assertNotIn("sent 2 articles", printed.getvalue())
                         self.assertEqual(state.read_text().splitlines(), [
                             initial_seen.decode().strip(),
                             *[harvest.title_key(title) for title, _ in articles],
@@ -297,6 +304,12 @@ class HarvestEntryPointTests(unittest.TestCase):
             {"status": "skip", "reason": "insufficient_source"},
         ]})
         self.assertEqual(self.run_harvest([completion(reply)], all_skipped=True), 1)
+
+    def test_partial_batch_reports_partial_and_preserves_existing_history_policy(self):
+        self.assertEqual(self.run_harvest([completion(takeaways(
+            "A supported explanation for the first item.",
+            "A supported explanation for the second item.",
+        ))], partial=True), 1)
 
     def test_valid_batch_still_sends_and_remembers_articles(self):
         calls = self.run_harvest([
@@ -367,6 +380,58 @@ class SourceEvidenceTests(unittest.TestCase):
             self.assertEqual(harvest.validate_takeaways(Mock(),
                 [{"title": "Study", "description": "No figures supplied"}], ["19% faster"]), [None])
             request.assert_not_called()
+
+
+class SmtpOutcomeTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(patch.stopall)
+        patch.dict(os.environ, {
+            "GMAIL_USER": "sender@example.invalid", "GMAIL_APP_PASSWORD": "test-only",
+            "GMAIL_TO": "one@example.invalid,two@example.invalid",
+        }).start()
+        self.smtp = patch.object(harvest.smtplib, "SMTP_SSL").start()
+        self.mail = self.smtp.return_value.__enter__.return_value
+
+    def test_full_acceptance_is_counted(self):
+        self.mail.sendmail.return_value = {}
+        self.assertEqual(harvest.send_email("<p>Lesson</p>"), (2, 0))
+        self.mail.sendmail.assert_called_once()
+
+    def test_partial_refusals_are_counted(self):
+        self.mail.sendmail.return_value = {"two@example.invalid": (550, b"refused")}
+        self.assertEqual(harvest.send_email("<p>Lesson</p>"), (1, 1))
+
+    def test_timeout_is_uncertain_and_does_not_expose_details(self):
+        self.mail.sendmail.side_effect = TimeoutError("one@example.invalid test-only")
+        with self.assertRaisesRegex(RuntimeError, "smtp_uncertain") as stopped:
+            harvest.send_email("<p>Lesson</p>")
+        self.assertNotIn("example.invalid", str(stopped.exception))
+        self.assertNotIn("test-only", str(stopped.exception))
+        self.mail.sendmail.assert_called_once()
+
+    def test_all_refusals_are_sanitized(self):
+        self.mail.sendmail.side_effect = harvest.smtplib.SMTPRecipientsRefused({
+            "one@example.invalid": (550, b"private server details")})
+        with self.assertRaisesRegex(RuntimeError, "smtp_rejected") as stopped:
+            harvest.send_email("<p>Lesson</p>")
+        self.assertNotIn("example.invalid", str(stopped.exception))
+
+    def test_login_failure_is_not_sent(self):
+        self.mail.login.side_effect = harvest.smtplib.SMTPAuthenticationError(535, b"private")
+        with self.assertRaisesRegex(RuntimeError, "smtp_not_sent"):
+            harvest.send_email("<p>Lesson</p>")
+        self.mail.sendmail.assert_not_called()
+
+    def test_cleanup_failure_preserves_confirmed_acceptance(self):
+        self.mail.sendmail.return_value = {}
+        self.smtp.return_value.__exit__.side_effect = harvest.smtplib.SMTPServerDisconnected("private")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(harvest.send_email("<p>Lesson</p>"), (2, 0))
+
+    def test_data_rejection_is_definite(self):
+        self.mail.sendmail.side_effect = harvest.smtplib.SMTPDataError(550, b"private")
+        with self.assertRaisesRegex(RuntimeError, "smtp_rejected"):
+            harvest.send_email("<p>Lesson</p>")
 
 
 if __name__ == "__main__":

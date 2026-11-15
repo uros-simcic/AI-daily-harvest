@@ -100,3 +100,9 @@ video, one email every Sunday.
 ## Preview without sending
 
 Select the manual workflow preview input to generate takeaways without SMTP or updating sent history. Locally, set HARVEST_PREVIEW=1; only MISTRAL_API_KEY is required. Preview HTML appears in workflow output. A provider failure stops the run instead of substituting feed descriptions. Takeaways are limited to 28 words and must be grounded in the supplied source; unsuitable items are skipped.
+
+### SMTP outcomes
+
+Logs distinguish full acceptance, partial recipient refusal, definite rejection, and uncertain acceptance after a send failure. Only counts are reported; recipient addresses and raw SMTP error details are omitted. A connection-close error after confirmed acceptance does not trigger a resend. No immediate retries are added.
+
+Partial delivery keeps the existing sent-title history policy and requires recipient-specific recovery; replaying the digest to everyone can duplicate mail. The Actions cache is not a durable per-recipient delivery ledger. A later rerun after an uncertain send can still duplicate delivery; this change reports that risk rather than solving idempotency.
