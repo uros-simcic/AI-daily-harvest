@@ -362,11 +362,11 @@ class SourceEvidenceTests(unittest.TestCase):
         self.assertFalse(harvest.has_unsupported_identifiers("It was 19% faster.",
             {"title": "Study", "description": "The model was 19% faster."}))
 
-    def test_unavailable_thin_article_is_skipped(self):
+    def test_unavailable_thin_article_keeps_feed_text(self):
         article = {"source": "TechCrunch AI", "title": "Study",
                    "url": "https://techcrunch.com/study", "description": "Thin source"}
         with patch.object(harvest.requests, "get", side_effect=harvest.requests.ConnectionError):
-            self.assertEqual(harvest.enrich_sources([article]), [])
+            self.assertEqual(harvest.enrich_sources([article]), [article])
 
     def test_long_feed_avoids_article_request(self):
         article = {"source": "TechCrunch AI", "title": "Study",
