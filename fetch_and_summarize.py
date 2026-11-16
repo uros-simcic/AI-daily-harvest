@@ -297,7 +297,7 @@ def clean_summary(text):
 
 
 # Short RSS blurbs rarely contain enough evidence for a useful lesson.
-MIN_SOURCE_WORDS = 80
+MIN_SOURCE_WORDS = 80  # enrichment trigger, not an eligibility requirement
 ARTICLE_MAX_BYTES = 1_000_000
 
 
@@ -335,35 +335,38 @@ class ArticleTextParser(HTMLParser):
 
 
 def enrich_sources(articles):
-    """Fetch fuller evidence for thin feeds; skip if it remains unavailable."""
+    """Try fuller evidence for thin feeds, preserving original source text."""
     enriched = []
-    for article in articles:
+    for index, article in enumerate(articles, 1):
         description = article["description"][:MAX_STORY_CHARS]
         if len(description.split()) < MIN_SOURCE_WORDS:
             domains = FEEDS[article["source"]]["domains"]
             if not safe_link(article["url"], domains):
+                print(f"[info] source {index}: excluded unsafe_link")
                 continue
             try:
                 with requests.get(article["url"], timeout=HTTP_TIMEOUT,
                         headers={"User-Agent": USER_AGENT}, stream=True,
                         allow_redirects=False) as response:
-                    if response.status_code != 200 or "text/html" not in response.headers.get("content-type", "").lower():
-                        continue
-                    body = bytearray()
-                    for chunk in response.iter_content(65536):
-                        body.extend(chunk)
-                        if len(body) > ARTICLE_MAX_BYTES:
-                            break
-                    if len(body) > ARTICLE_MAX_BYTES:
-                        continue
-                    parser = ArticleTextParser()
-                    parser.feed(body.decode(response.encoding or "utf-8", errors="replace"))
-                    description = " ".join("".join(parser.parts).split())[:MAX_STORY_CHARS]
+                    if response.status_code == 200 and "text/html" in response.headers.get("content-type", "").lower():
+                        body = bytearray()
+                        for chunk in response.iter_content(65536):
+                            body.extend(chunk)
+                            if len(body) > ARTICLE_MAX_BYTES:
+                                break
+                        if len(body) <= ARTICLE_MAX_BYTES:
+                            parser = ArticleTextParser()
+                            parser.feed(body.decode(response.encoding or "utf-8", errors="replace"))
+                            fuller = " ".join("".join(parser.parts).split())[:MAX_STORY_CHARS]
+                            if len(fuller.split()) > len(description.split()):
+                                description = fuller
             except (requests.RequestException, UnicodeError, LookupError):
-                continue
-        if len(description.split()) >= MIN_SOURCE_WORDS:
+                pass  # The original feed text can still support a takeaway.
+        if description.strip():
             enriched.append({**article, "description": description})
-    print(f"[info] skipped {len(articles) - len(enriched)} item(s) without sufficient source text")
+        else:
+            print(f"[info] source {index}: excluded empty_source")
+    print(f"[info] skipped {len(articles) - len(enriched)} item(s) without usable source text")
     return enriched
 
 
@@ -404,12 +407,13 @@ def parse_summaries(reply, count):
     if len(items) != count:
         raise ValueError("takeaway count does not match input count")
     texts = []
-    for item in items:
+    for index, item in enumerate(items, 1):
         if not isinstance(item, dict):
             raise ValueError("takeaway item must be an object")
         if item.get("status") == "skip":
             if item.get("reason") not in {"promotion", "insufficient_source"}:
                 raise ValueError("invalid skip reason")
+            print(f"[info] generation item {index}: excluded {item['reason']}")
             texts.append(None)
             continue
         if item.get("status") != "keep" or not isinstance(item.get("takeaway"), str):
@@ -433,8 +437,11 @@ GROUNDING_INSTRUCTIONS = (
 
 
 def validate_takeaways(client, articles, summaries):
-    summaries = [text if text is None or not has_unsupported_identifiers(text, article)
-                 else None for article, text in zip(articles, summaries)]
+    summaries = list(summaries)
+    for index, (article, text) in enumerate(zip(articles, summaries)):
+        if text is not None and has_unsupported_identifiers(text, article):
+            print(f"[info] validation item {index + 1}: excluded unsupported_identifier")
+            summaries[index] = None
     candidates = [
         {"title": article["title"],
          "description": article["description"][:MAX_STORY_CHARS],
@@ -456,8 +463,13 @@ def validate_takeaways(client, articles, summaries):
     except Exception:
         raise RuntimeError("Grounding check failed; digest was not sent") from None
     decisions = iter(verdicts)
-    return [text if text is not None and next(decisions) else None
-            for text in summaries]
+    checked = []
+    for index, text in enumerate(summaries, 1):
+        if text is not None and not next(decisions):
+            print(f"[info] validation item {index}: excluded grounding_check")
+            text = None
+        checked.append(text)
+    return checked
 
 
 def request_takeaways(client, articles):
@@ -830,6 +842,8 @@ if __name__ == "__main__":
     fresh = enrich_sources(fresh)
     if not fresh:
         sys.exit("no eligible source text; no email sent")
+    for index, article in enumerate(fresh, 1):
+        print(f"[info] validation item {index}: {json.dumps(article['title'], ensure_ascii=True)}")
     client = build_client()
     summaries = summarize_all(client, fresh)
     summaries = validate_takeaways(client, fresh, summaries)
