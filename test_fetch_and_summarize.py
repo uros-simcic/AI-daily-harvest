@@ -54,6 +54,48 @@ class SafeLinkTests(unittest.TestCase):
         self.assertFalse(safe_link("http://techcrunch.com/x", ["techcrunch.com"]))
 
 
+class RundownSectionTests(unittest.TestCase):
+    def split(self, body, link="https://therundownai.beehiiv.com/p/example"):
+        return harvest.split_issue(
+            {"link": link, "content": [{"value": body}]},
+            "The Rundown AI", ["therundown.ai", "therundownai.beehiiv.com"])
+
+    def test_news_with_why_it_matters_is_kept(self):
+        stories = self.split("<h6>RESEARCH</h6><h4>New model</h4>"
+                             "<p>The Rundown: Evidence. Why it matters: A limitation.</p>")
+        self.assertEqual([s["title"] for s in stories], ["New model"])
+
+    def test_editorial_teaching_does_not_need_why_it_matters(self):
+        for category in ["AI TRAINING", "ROWAN\u2019S CORNER", "NATE'S NOTEBOOK"]:
+            with self.subTest(category=category):
+                stories = self.split(f"<h6>{category}</h6><h4>Practical lesson</h4>"
+                                     "<p>Compare the formula with a known result.</p>")
+                self.assertEqual(len(stories), 1)
+                self.assertIn("known result", stories[0]["description"])
+
+    def test_sponsors_are_excluded_even_with_why_it_matters(self):
+        for category in ["TOGETHER WITH ACME", "PRESENTED BY ACME", "SPONSORED BY ACME"]:
+            with self.subTest(category=category):
+                self.assertEqual(self.split(f"<h6>{category}</h6><h4>Buy this</h4>"
+                                            "<p>Why it matters: Register now.</p>"), [])
+
+    def test_unknown_sections_are_not_treated_as_teaching(self):
+        self.assertEqual(self.split("<h6>OTHER</h6><h4>Link roundup</h4>"
+                                    "<p>Unclassified material.</p>"), [])
+
+    def test_sections_do_not_leak_into_previous_story(self):
+        stories = self.split("<h6>GOOGLE</h6><h4>News</h4>"
+                             "<p>Why it matters: Supported detail.</p>"
+                             "<h6>COMMUNITY</h6><p>Unrelated community text.</p>"
+                             "<h3>Everything else</h3><p>Unrelated roundup.</p>")
+        self.assertEqual(len(stories), 1)
+        self.assertNotIn("Unrelated", stories[0]["description"])
+
+    def test_unsafe_issue_link_is_rejected(self):
+        self.assertEqual(self.split("<h6>AI TRAINING</h6><h4>Lesson</h4>"
+                                    "<p>Useful text.</p>", "https://example.com/story"), [])
+
+
 class UnwrapTests(unittest.TestCase):
     def test_bing_apiclick_extracts_venturebeat(self):
         wrapped = (

@@ -160,30 +160,38 @@ def entry_is_fresh(entry):
 
 
 def split_issue(entry, source, domain):
-    """The Rundown's daily post bundles several stories with ads and
-    tool guides in between. Split the post body on its headings and
-    keep only blocks with a 'Why it matters' section - real news
-    stories always have one, ads and guides never do. The individual
-    stories have no urls of their own, so they share the post's url."""
+    """Keep news and editorial teaching sections; exclude sponsor blocks."""
     link = unwrap_article_url(entry.get("link", ""))
     if not safe_link(link, domain):
         print(f"[warn] {source}: skipping issue with suspect url: {link}")
         return []
     body = entry.get("content", [{}])[0].get("value", "") or entry.get("summary", "")
     stories = []
-    # split keeps the heading texts at odd indexes, block bodies follow
-    parts = re.split(r"<h[34][^>]*>(.*?)</h[34]>", body, flags=re.S)
-    for i in range(1, len(parts) - 1, 2):
-        text = re.sub(r"\s+", " ",
-                      html.unescape(TAG_RE.sub(" ", parts[i + 1]))).strip()
-        if "Why it matters" not in text:
+    teaching_sections = {"AI TRAINING", "ROWAN'S CORNER", "NATE'S NOTEBOOK"}
+    sponsor_prefixes = ("TOGETHER WITH", "PRESENTED BY", "SPONSORED BY")
+    category = ""
+    # Category headings also delimit stories, keeping later sections separate.
+    parts = re.split(r"<h([346])\b[^>]*>(.*?)</h\1>", body, flags=re.S | re.I)
+    for i in range(1, len(parts) - 2, 3):
+        level, heading, block = parts[i:i + 3]
+        if level == "6":
+            category = html.unescape(TAG_RE.sub("", heading)).strip().upper()
+            category = category.replace("\u2019", "'")
             continue
-        # drop image credits and other lead-in before the story text
+        if level == "3":
+            category = ""
+            continue
+        if category.startswith(sponsor_prefixes):
+            continue
+        text = re.sub(r"\s+", " ",
+                      html.unescape(TAG_RE.sub(" ", block))).strip()
+        if not text or ("Why it matters" not in text and category not in teaching_sections):
+            continue
         if "The Rundown:" in text:
             text = text[text.index("The Rundown:"):]
         stories.append({
             "source": source,
-            "title": TAG_RE.sub("", parts[i]).strip(),
+            "title": TAG_RE.sub("", heading).strip(),
             "url": link,
             "description": text[:MAX_STORY_CHARS],
         })
