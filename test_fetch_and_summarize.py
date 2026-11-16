@@ -124,6 +124,27 @@ class LooksLikeFeedTests(unittest.TestCase):
         self.assertFalse(looks_like_feed(body, "text/html; charset=utf-8"))
 
 
+class TakeawayErrorReasonTests(unittest.TestCase):
+    def test_known_validation_reasons(self):
+        self.assertEqual(harvest.takeaway_error_reason(
+            ValueError("empty or oversized teaching takeaway")), "empty_or_oversized")
+        self.assertEqual(harvest.takeaway_error_reason(
+            ValueError("takeaway count does not match input count")), "item_count")
+
+    def test_invalid_json_does_not_expose_reply(self):
+        secret = "private-provider-reply"
+        try:
+            json.loads(secret)
+        except json.JSONDecodeError as exc:
+            self.assertEqual(harvest.takeaway_error_reason(exc), "invalid_json")
+
+    def test_unknown_errors_do_not_expose_details(self):
+        self.assertEqual(harvest.takeaway_error_reason(
+            ValueError("private-provider-reply")), "unknown_validation")
+        self.assertEqual(harvest.takeaway_error_reason(
+            RuntimeError("private-provider-reply")), "RuntimeError")
+
+
 class SummaryParseTests(unittest.TestCase):
     def test_plain_json(self):
         self.assertEqual(

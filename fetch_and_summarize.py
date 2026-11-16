@@ -492,12 +492,29 @@ def request_takeaways(client, articles):
     return parse_summaries(response.choices[0].message.content, len(articles))
 
 
+def takeaway_error_reason(exc):
+    """Report known validation failures without exposing provider error details."""
+    if isinstance(exc, json.JSONDecodeError):
+        return "invalid_json"
+    reasons = {
+        "expected an items list": "invalid_items",
+        "takeaway count does not match input count": "item_count",
+        "takeaway item must be an object": "invalid_item",
+        "invalid skip reason": "skip_reason",
+        "expected a teaching takeaway": "invalid_takeaway",
+        "empty or oversized teaching takeaway": "empty_or_oversized",
+    }
+    if type(exc) is ValueError:
+        return reasons.get(str(exc), "unknown_validation")
+    return type(exc).__name__
+
+
 def summarize(client, article):
     """Produce a takeaway or intentional skip; never use raw feed copy."""
     try:
         return request_takeaways(client, [article])[0]
     except Exception as exc:
-        print(f"[warn] takeaway generation failed: {type(exc).__name__}")
+        print(f"[warn] takeaway generation failed: {takeaway_error_reason(exc)}")
         raise RuntimeError("Takeaway generation failed; digest was not sent") from None
 
 
@@ -508,7 +525,7 @@ def summarize_all(client, articles):
     try:
         return request_takeaways(client, articles)
     except Exception as exc:
-        print(f"[warn] batched takeaway generation failed: {type(exc).__name__}")
+        print(f"[warn] batched takeaway generation failed: {takeaway_error_reason(exc)}")
         if is_rate_limited(exc):
             raise RuntimeError(
                 "Takeaway provider remains rate-limited; digest was not sent"
