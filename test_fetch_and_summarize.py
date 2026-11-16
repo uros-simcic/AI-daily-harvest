@@ -124,6 +124,60 @@ class LooksLikeFeedTests(unittest.TestCase):
         self.assertFalse(looks_like_feed(body, "text/html; charset=utf-8"))
 
 
+class ReliabilityRepairTests(unittest.TestCase):
+    def test_only_invalid_batch_item_is_retried(self):
+        valid = "Check generated dates against the supplied plan before sharing."
+        batch = takeaways(valid, "word " * 29)
+        with patch.object(harvest, "chat_complete", side_effect=[
+            completion(batch), completion(takeaways("A repaired supported lesson.")),
+        ]) as request:
+            result = harvest.summarize_all(Mock(), [{"title": "A", "description": "Evidence"},
+                                                    {"title": "B", "description": "Evidence"}])
+        self.assertEqual(result, [valid, "A repaired supported lesson."])
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(json.loads(request.call_args.args[2][1]["content"])[0]["title"], "B")
+
+    def test_invalid_retry_preserves_other_valid_batch_item(self):
+        with patch.object(harvest, "chat_complete", side_effect=[
+            completion(takeaways("A supported lesson.", "word " * 29)),
+            completion("not JSON"),
+        ]):
+            self.assertEqual(harvest.summarize_all(Mock(), [{"title": "A", "description": "Evidence"},
+                                                        {"title": "B", "description": "Evidence"}]),
+                             ["A supported lesson.", None])
+
+    def test_all_invalid_responses_fail_before_sending(self):
+        with patch.object(harvest, "chat_complete", side_effect=[
+            completion(takeaways("word " * 29)), completion("not JSON"),
+        ]):
+            with self.assertRaisesRegex(RuntimeError, "No valid takeaways"):
+                harvest.summarize_all(Mock(), [{"title": "A", "description": "Evidence"}])
+
+    def test_freshness_uses_utc_feed_timestamp(self):
+        published = (2026, 11, 13, 10, 0, 0, 4, 317, 0)
+        with (patch.object(harvest.time, "time", return_value=1794821166),
+              patch.object(harvest.time, "mktime", side_effect=AssertionError("local time used"))):
+            self.assertTrue(harvest.entry_is_fresh({"published_parsed": published}))
+        with patch.object(harvest.time, "time", return_value=1794826801):
+            self.assertFalse(harvest.entry_is_fresh({"published_parsed": published}))
+
+    def test_filtered_and_seen_entries_do_not_consume_candidate_slots(self):
+        titles = ["Author", "Old story", "First", "Second", "Third", "Fourth"]
+        paths = ["author/person", "orchestration/old",
+                 "orchestration/first", "orchestration/second",
+                 "orchestration/third", "orchestration/fourth"]
+        rss = ("<rss version='2.0'><channel>" + "".join(
+            f"<item><title>{title}</title><link>https://venturebeat.com/{path}</link>"
+            "<description>Source text.</description></item>"
+            for title, path in zip(titles, paths)) + "</channel></rss>").encode()
+        empty = b"<rss version='2.0'><channel></channel></rss>"
+        with patch.object(harvest, "download_feed",
+                          side_effect=lambda urls, source: rss if source == "VentureBeat AI" else empty):
+            articles = harvest.fetch_articles([harvest.title_key("Old story")])
+        fresh = [a["title"] for a in articles if a["title"] != "Old story"]
+        self.assertEqual(fresh, ["First", "Second", "Third", "Fourth"])
+
+
 class SummaryParseTests(unittest.TestCase):
     def test_plain_json(self):
         self.assertEqual(
@@ -202,8 +256,7 @@ class GenerationFailureTests(unittest.TestCase):
 
     def test_empty_single_generation_does_not_return_feed_copy(self):
         with patch.object(harvest, "chat_complete", return_value=completion("  ")):
-            with self.assertRaisesRegex(RuntimeError, "digest was not sent"):
-                harvest.summarize(Mock(), self.article)
+            self.assertIsNone(harvest.summarize(Mock(), self.article))
 
     def test_persistent_batch_rate_limit_does_not_start_individual_requests(self):
         output = io.StringIO()
@@ -250,8 +303,9 @@ class HarvestEntryPointTests(unittest.TestCase):
         provider = Mock()
         generation_replies = Mock(side_effect=replies)
 
-        def respond(*, model, messages, max_tokens):
+        def respond(*, model, messages, max_tokens, response_format):
             self.assertEqual(max_tokens, 2048)
+            self.assertEqual(response_format, {"type": "json_object"})
             if messages[0]["content"] == harvest.GROUNDING_INSTRUCTIONS:
                 count = len(json.loads(messages[1]["content"]))
                 return completion(json.dumps({"supported": [True] * count}))
@@ -328,11 +382,11 @@ class HarvestEntryPointTests(unittest.TestCase):
         ], error="digest was not sent")
         self.assertEqual(calls, 3)
 
-    def test_empty_individual_result_sends_nothing_and_preserves_history(self):
+    def test_empty_individual_results_send_nothing_and_preserve_history(self):
         calls = self.run_harvest([
-            completion("not JSON"), completion("  "),
-        ], error="digest was not sent")
-        self.assertEqual(calls, 2)
+            completion("not JSON"), completion("  "), completion("  "),
+        ], error="No valid takeaways after response repair")
+        self.assertEqual(calls, 3)
 
     def test_preview_never_sends_or_updates_history(self):
         self.assertEqual(self.run_harvest([completion(takeaways(
