@@ -146,6 +146,22 @@ class ReliabilityRepairTests(unittest.TestCase):
                                                         {"title": "B", "description": "Evidence"}]),
                              ["A supported lesson.", None])
 
+    def test_malformed_twenty_story_batch_repairs_in_three_groups(self):
+        articles = [{"title": str(i), "description": "Evidence"} for i in range(20)]
+        lessons = [f"Lesson {i}." for i in range(20)]
+        output = io.StringIO()
+        with (patch.object(harvest, "chat_complete", side_effect=[
+                  completion("invalid response with raw details"),
+                  completion(takeaways(*lessons[:7])),
+                  completion(takeaways(*lessons[7:14])),
+                  completion(takeaways(*lessons[14:])),
+              ]) as request, contextlib.redirect_stdout(output)):
+            self.assertEqual(harvest.summarize_all(Mock(), articles), lessons)
+        sizes = [len(json.loads(call.args[2][1]["content"])) for call in request.call_args_list]
+        self.assertEqual(sizes, [20, 7, 7, 6])
+        self.assertIn("invalid takeaway JSON", output.getvalue())
+        self.assertNotIn("raw details", output.getvalue())
+
     def test_all_invalid_responses_fail_before_sending(self):
         with patch.object(harvest, "chat_complete", side_effect=[
             completion(takeaways("word " * 29)), completion("not JSON"),
@@ -221,8 +237,18 @@ class RateLimitTests(unittest.TestCase):
     def test_other_errors_not_rate_limits(self):
         self.assertFalse(is_rate_limited(Exception("timeout connecting to api")))
 
-    def test_gap_clears_one_request_per_second(self):
-        self.assertGreaterEqual(MIN_REQUEST_GAP, 2.0)
+    def test_gap_respects_the_free_account_request_limit(self):
+        self.assertGreaterEqual(MIN_REQUEST_GAP, 35.0)
+
+    def test_optional_duplicate_failure_uses_one_call_and_hides_payload(self):
+        output = io.StringIO()
+        article = {"title": "A story", "description": "Evidence"}
+        with (patch.object(harvest, "chat_complete",
+                           return_value=completion("raw provider output")) as request,
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(harvest.llm_duplicates(Mock(), [article, article]), {})
+        self.assertEqual(request.call_count, 1)
+        self.assertNotIn("raw provider output", output.getvalue())
 
     def test_duplicate_model_is_pinned(self):
         self.assertFalse(DUP_MODEL.endswith("-latest"))
@@ -245,28 +271,18 @@ class GenerationFailureTests(unittest.TestCase):
             "description": "Register before prices increase at the door.",
         }
 
-    def test_failed_single_generation_does_not_return_feed_copy(self):
+    def test_provider_error_reports_http_status_without_retrying_articles(self):
         output = io.StringIO()
-        with patch.object(harvest, "chat_complete", side_effect=RuntimeError("provider detail")):
-            with contextlib.redirect_stdout(output):
-                with self.assertRaisesRegex(RuntimeError, "digest was not sent"):
-                    harvest.summarize(Mock(), self.article)
+        error = RuntimeError("provider detail containing 429")
+        error.status_code = 503
+        with (patch.object(harvest, "chat_complete", side_effect=error) as request,
+              contextlib.redirect_stdout(output)):
+            with self.assertRaisesRegex(RuntimeError, "digest was not sent"):
+                harvest.summarize_all(Mock(), [self.article, self.article])
+        self.assertEqual(request.call_count, 1)
+        self.assertIn("HTTP 503", output.getvalue())
         self.assertNotIn("provider detail", output.getvalue())
         self.assertNotIn(self.article["title"], output.getvalue())
-
-    def test_empty_single_generation_does_not_return_feed_copy(self):
-        with patch.object(harvest, "chat_complete", return_value=completion("  ")):
-            self.assertIsNone(harvest.summarize(Mock(), self.article))
-
-    def test_persistent_batch_rate_limit_does_not_start_individual_requests(self):
-        output = io.StringIO()
-        with patch.object(harvest, "chat_complete", side_effect=RuntimeError("429 provider detail")):
-            with patch.object(harvest, "summarize") as individual:
-                with contextlib.redirect_stdout(output):
-                    with self.assertRaisesRegex(RuntimeError, "remains rate-limited"):
-                        harvest.summarize_all(Mock(), [self.article, self.article])
-                individual.assert_not_called()
-        self.assertNotIn("provider detail", output.getvalue())
 
     def test_malformed_batch_can_still_recover_with_valid_individual_output(self):
         with patch.object(harvest, "chat_complete", side_effect=[
@@ -332,7 +348,9 @@ class HarvestEntryPointTests(unittest.TestCase):
                     }, clear=True))
                     stack.enter_context(patch("dotenv.load_dotenv"))
                     stack.enter_context(patch("requests.get", side_effect=feed_response))
-                    stack.enter_context(patch("mistralai.client.Mistral", return_value=provider))
+                    client_factory = stack.enter_context(
+                        patch("mistralai.client.Mistral", return_value=provider),
+                    )
                     stack.enter_context(patch("time.sleep"))
                     smtp = stack.enter_context(patch("smtplib.SMTP_SSL"))
                     smtp.return_value.__enter__.return_value.sendmail.return_value = (
@@ -344,6 +362,9 @@ class HarvestEntryPointTests(unittest.TestCase):
                             runpy.run_path(str(script), run_name="__main__")
                         smtp.assert_not_called()
                         self.assertEqual(state.read_bytes(), initial_seen)
+                        client_factory.assert_called_once_with(
+                            api_key="test-only", timeout_ms=30_000,
+                        )
                     else:
                         if preview or all_skipped:
                             with self.assertRaises(SystemExit) as stopped:
@@ -367,7 +388,7 @@ class HarvestEntryPointTests(unittest.TestCase):
         return generation_replies.call_count
 
     def test_batch_429_exhausts_only_one_retry_budget_without_send_or_state_change(self):
-        attempts = harvest.RATE_LIMIT_RETRIES + 1
+        attempts = 2
         calls = self.run_harvest(
             [RuntimeError("429 rate limited")] * attempts,
             error="remains rate-limited",
@@ -376,11 +397,10 @@ class HarvestEntryPointTests(unittest.TestCase):
 
     def test_partial_generation_then_failure_sends_nothing_and_preserves_history(self):
         calls = self.run_harvest([
-            completion("not JSON"),
-            completion(takeaways("A supported explanation for the first item.")),
+            completion(takeaways("A supported explanation for the first item.", "word " * 29)),
             RuntimeError("provider unavailable"),
         ], error="digest was not sent")
-        self.assertEqual(calls, 3)
+        self.assertEqual(calls, 2)
 
     def test_empty_individual_results_send_nothing_and_preserve_history(self):
         calls = self.run_harvest([

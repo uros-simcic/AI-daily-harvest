@@ -62,7 +62,9 @@ MISTRAL_MODEL = "ministral-14b-2512"
 DUP_MODEL = "ministral-14b-2512"
 # The console lists 0.03 requests/second; leave at least 35 seconds.
 MIN_REQUEST_GAP = 35.0
-RATE_LIMIT_RETRIES = 4
+RATE_LIMIT_RETRIES = 1
+MISTRAL_TIMEOUT_MS = 30_000
+TAKEAWAY_REPAIR_GROUPS = 3
 HTTP_TIMEOUT = 15
 # some news sites 403 requests without a browser-like user agent
 USER_AGENT = (
@@ -258,25 +260,30 @@ def build_client():
     api_key = os.environ.get("MISTRAL_API_KEY")
     if not api_key:
         sys.exit("MISTRAL_API_KEY is not set")
-    return Mistral(api_key=api_key)
+    return Mistral(api_key=api_key, timeout_ms=MISTRAL_TIMEOUT_MS)
 
 
 _last_request_at = 0.0
 
 
+def provider_failure_label(exc):
+    status = getattr(exc, "status_code", None)
+    if type(status) is int and 100 <= status <= 599:
+        return f"HTTP {status}"
+    return type(exc).__name__
+
+
 def is_rate_limited(exc):
+    status = getattr(exc, "status_code", None)
+    if type(status) is int:
+        return status == 429
     text = str(exc).lower()
     return "429" in text or "rate_limited" in text or "rate limit" in text
 
 
 def chat_complete(client, model, messages):
-    """One chat call, spaced for the model's free-account request limit.
-
-    On 429 wait 2, 4, 8, 16 seconds rather than retrying immediately,
-    which is what used to burn the rest of the run.
-    """
+    """Keep the free-account request spacing, with one retry on HTTP 429."""
     global _last_request_at
-    last_err = None
     for attempt in range(RATE_LIMIT_RETRIES + 1):
         wait = MIN_REQUEST_GAP - (time.monotonic() - _last_request_at)
         if wait > 0:
@@ -289,15 +296,10 @@ def chat_complete(client, model, messages):
                 max_tokens=2048,
                 response_format={"type": "json_object"},
             )
-        except Exception as e:
-            last_err = e
-            if not is_rate_limited(e) or attempt == RATE_LIMIT_RETRIES:
+        except Exception as exc:
+            if not is_rate_limited(exc) or attempt == RATE_LIMIT_RETRIES:
                 raise
-            sleep_s = 2 ** (attempt + 1)
-            print(f"[warn] {model} rate-limited, waiting {sleep_s}s "
-                  f"(attempt {attempt + 1}/{RATE_LIMIT_RETRIES})")
-            time.sleep(sleep_s)
-    raise last_err
+            print(f"[warn] {model} rate-limited; retrying after request spacing")
 
 
 def strip_json_fence(text):
@@ -423,7 +425,11 @@ TAKEAWAY_INSTRUCTIONS = (
 )
 
 
-class TakeawayItemErrors(ValueError):
+class TakeawayFormatError(ValueError):
+    """Report a fixed validation rule without including response content."""
+
+
+class TakeawayItemErrors(TakeawayFormatError):
     """Preserve valid batch results while identifying items needing repair."""
     def __init__(self, texts, invalid):
         super().__init__("invalid takeaway items")
@@ -433,33 +439,37 @@ class TakeawayItemErrors(ValueError):
 
 def parse_takeaway_item(item, index):
     if not isinstance(item, dict):
-        raise ValueError("takeaway item must be an object")
+        raise TakeawayFormatError("takeaway item must be an object")
     if item.get("status") == "skip":
         if item.get("reason") not in {"promotion", "insufficient_source"}:
-            raise ValueError("invalid skip reason")
+            raise TakeawayFormatError("invalid skip reason")
         print(f"[info] generation item {index}: excluded {item['reason']}")
         return None
     if item.get("status") != "keep" or not isinstance(item.get("takeaway"), str):
-        raise ValueError("expected a teaching takeaway")
+        raise TakeawayFormatError("expected a teaching takeaway")
     text = clean_summary(item["takeaway"])
     if not text or len(text.split()) > 28:
-        raise ValueError("empty or oversized teaching takeaway")
+        raise TakeawayFormatError("empty or oversized teaching takeaway")
     return text
 
 
 def parse_summaries(reply, count):
     """Keep input alignment and preserve valid items for bounded repair."""
-    payload = json.loads(strip_json_fence(reply))
+    try:
+        payload = json.loads(strip_json_fence(reply)) if isinstance(reply, str) else None
+    except json.JSONDecodeError:
+        raise TakeawayFormatError("invalid takeaway JSON") from None
     if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
-        raise ValueError("expected an items list")
+        raise TakeawayFormatError("expected an items list")
     items = payload["items"]
     if len(items) != count:
-        raise ValueError("takeaway count does not match input count")
+        raise TakeawayFormatError("takeaway count does not match input count")
     texts, invalid = [], []
     for index, item in enumerate(items, 1):
         try:
             texts.append(parse_takeaway_item(item, index))
-        except ValueError:
+        except TakeawayFormatError as exc:
+            print(f"[warn] takeaway item {index}: {exc}")
             texts.append(None)
             invalid.append(index - 1)
     if invalid:
@@ -502,8 +512,12 @@ def validate_takeaways(client, articles, summaries):
         verdicts = payload.get("supported") if isinstance(payload, dict) else None
         if (not isinstance(verdicts, list) or len(verdicts) != len(candidates)
                 or any(type(value) is not bool for value in verdicts)):
-            raise ValueError("invalid grounding verdicts")
-    except Exception:
+            raise TakeawayFormatError("invalid grounding verdicts")
+    except (json.JSONDecodeError, TakeawayFormatError):
+        print("[warn] grounding response must contain one boolean per candidate")
+        raise RuntimeError("Grounding check failed; digest was not sent") from None
+    except Exception as exc:
+        print(f"[warn] grounding request failed: {provider_failure_label(exc)}")
         raise RuntimeError("Grounding check failed; digest was not sent") from None
     decisions = iter(verdicts)
     checked = []
@@ -524,38 +538,49 @@ def request_takeaways(client, articles):
         {"role": "system", "content": TAKEAWAY_INSTRUCTIONS},
         {"role": "user", "content": json.dumps(source)},
     ])
+    if not response.choices:
+        raise TakeawayFormatError("takeaway response has no choices")
     return parse_summaries(response.choices[0].message.content, len(articles))
 
 
-def summarize(client, article):
-    """Repair one item once; discard invalid output without using feed copy."""
+def generate_takeaway_group(client, articles):
+    """Return aligned results and the indexes of any invalid responses."""
     try:
-        return request_takeaways(client, [article])[0]
-    except ValueError:
-        print("[warn] individual takeaway remained invalid; item omitted")
-        return None
-    except Exception as exc:
-        print(f"[warn] takeaway generation failed: {type(exc).__name__}")
-        raise RuntimeError("Takeaway generation failed; digest was not sent") from None
-
-
-def summarize_all(client, articles):
-    """Preserve valid batch items and retry only invalid items once."""
-    if not articles:
-        return []
-    try:
-        return request_takeaways(client, articles)
+        return request_takeaways(client, articles), []
     except TakeawayItemErrors as exc:
-        texts, invalid = exc.texts, exc.invalid
+        return exc.texts, exc.invalid
+    except TakeawayFormatError as exc:
+        print(f"[warn] invalid takeaway response for {len(articles)} item(s): {exc}")
+        return [None] * len(articles), list(range(len(articles)))
     except Exception as exc:
-        print(f"[warn] batched takeaway generation failed: {type(exc).__name__}")
+        print(f"[warn] takeaway generation request failed: {provider_failure_label(exc)}")
         if is_rate_limited(exc):
             raise RuntimeError(
                 "Takeaway provider remains rate-limited; digest was not sent"
             ) from None
-        texts, invalid = [None] * len(articles), list(range(len(articles)))
-    for index in invalid:
-        texts[index] = summarize(client, articles[index])
+        raise RuntimeError("Takeaway generation failed; digest was not sent") from None
+
+
+def summarize_all(client, articles):
+    """Keep valid takeaways and repair the rest in at most three requests."""
+    if not articles:
+        return []
+    texts, invalid = generate_takeaway_group(client, articles)
+    if not invalid:
+        return texts
+
+    group_size = (len(invalid) + TAKEAWAY_REPAIR_GROUPS - 1) // TAKEAWAY_REPAIR_GROUPS
+    omitted = 0
+    for start in range(0, len(invalid), group_size):
+        indexes = invalid[start:start + group_size]
+        repaired, still_invalid = generate_takeaway_group(
+            client, [articles[index] for index in indexes],
+        )
+        for index, takeaway in zip(indexes, repaired):
+            texts[index] = takeaway
+        omitted += len(still_invalid)
+    if omitted:
+        print(f"[warn] omitted {omitted} item(s) with invalid takeaways after repair")
     if not any(text is not None for text in texts):
         raise RuntimeError("No valid takeaways after response repair; digest was not sent")
     return texts
@@ -570,7 +595,6 @@ DUP_MIN_SHARED = 4
 DUP_MIN_CONTAINMENT = 0.30
 DUP_SNIPPET_CHARS = 300  # per-story text sent to the duplicate model
 DUP_MAX_DROP_RATIO = 0.5  # refuse a verdict that would delete half the harvest
-DUP_RETRIES = 2
 # The model may lower the lexical bar but not ignore it. Left to itself
 # it paired two stories with no words in common at all, and another two
 # whose only link was 'openai' and 'models' - words half the harvest
@@ -705,26 +729,12 @@ def llm_duplicates(client, articles):
         'answer {"groups": []}.\n\n'
         + listing
     )
-    reply = ""
-    for attempt in range(DUP_RETRIES + 1):
-        try:
-            resp = chat_complete(
-                client,
-                DUP_MODEL,
-                [{"role": "user", "content": prompt}],
-            )
-            reply = resp.choices[0].message.content or ""
-            groups = parse_duplicate_groups(reply, len(articles))
-            break
-        except Exception as e:
-            print(f"[warn] duplicate check attempt {attempt + 1} failed: {e}")
-            if reply:
-                print(f"[warn] raw reply was: {reply!r}")
-            # chat_complete already waited out 429s; don't hammer again
-            if is_rate_limited(e) or attempt == DUP_RETRIES:
-                print("[warn] duplicate check gave up, keeping every story")
-                return {}
-            time.sleep(2 ** attempt)
+    try:
+        response = chat_complete(client, DUP_MODEL, [{"role": "user", "content": prompt}])
+        groups = parse_duplicate_groups(response.choices[0].message.content, len(articles))
+    except Exception as exc:
+        print(f"[warn] model duplicate check failed: {provider_failure_label(exc)}")
+        return {}
 
     signatures = [story_signature(a) for a in articles]
     # how many of today's stories each term shows up in - a term in lots
