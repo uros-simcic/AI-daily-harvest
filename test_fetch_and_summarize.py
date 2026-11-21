@@ -323,9 +323,8 @@ class HarvestEntryPointTests(unittest.TestCase):
             self.assertEqual(max_tokens, 2048)
             self.assertEqual(response_format, {"type": "json_object"})
             if messages[0]["content"] == harvest.GROUNDING_INSTRUCTIONS:
-                candidates = json.loads(messages[1]["content"])
-                passages = [" ".join(item["description"].split()[:9]) for item in candidates]
-                return completion(json.dumps({"evidence": passages}))
+                count = len(json.loads(messages[1]["content"]))
+                return completion(json.dumps({"evidence": [1] * count}))
             if messages[0]["content"] != harvest.TAKEAWAY_INSTRUCTIONS:
                 return completion('{"groups": []}')
             return generation_replies()
@@ -442,49 +441,38 @@ class GroundingTests(unittest.TestCase):
     def test_rejected_and_skipped_items_keep_alignment(self):
         articles = [{"title": "Test", "description": "Source"}] * 3
         with patch.object(harvest, "chat_complete", return_value=completion(
-                '{"evidence": [null, "Source"]}')):
+                '{"evidence": [null, 1]}')):
             self.assertEqual(harvest.validate_takeaways(
                 Mock(), articles, ["Unsupported", None, "Supported"]),
                 [None, None, "Supported"])
 
-    def test_evidence_must_come_from_the_matching_description(self):
-        source_a = "Use parts that are in stock at this store."
-        source_b = "Ask the model to flag claims it cannot trace to your notes."
+    def test_passage_numbers_are_checked_against_each_article(self):
         articles = [
-            {"title": "Check inventory", "description": source_a},
-            {"title": "Review a draft", "description": source_b},
-            {"title": "Different source", "description": "Other text."},
-            {"title": source_a, "description": source_b},
+            {"title": "Check inventory",
+             "description": "The store posts stock online. Use only parts in stock."},
+            {"title": "Review a draft",
+             "description": "Ask the model to flag claims missing from your notes."},
+            {"title": "No source text", "description": " "},
         ]
-        lessons = [
-            "Limit the shopping list to parts in stock.",
-            "Ask the model to flag claims missing from your notes.",
-            "This source received a fabricated passage.",
-            "This source received a quote from the title.",
-        ]
-        reply = {"evidence": [
-            source_a.replace("in stock", "in\nstock"),
-            source_b,
-            "Fabricated passage with private provider details.",
-            source_a,
-        ]}
-        output = io.StringIO()
-        with (patch.object(harvest, "chat_complete",
-                           return_value=completion(json.dumps(reply))) as call,
-              contextlib.redirect_stdout(output)):
+        lessons = ["Use only parts in stock.", "Flag claims missing from your notes.",
+                   "A draft with no evidence."]
+        with patch.object(harvest, "chat_complete", return_value=completion(
+                '{"evidence": [2, 2]}')) as call:
             self.assertEqual(harvest.validate_takeaways(Mock(), articles, lessons),
-                             [lessons[0], lessons[1], None, None])
-        self.assertEqual(call.call_count, 1)
-        self.assertEqual(output.getvalue().count("excluded grounding_quote"), 2)
-        self.assertNotIn("private provider details", output.getvalue())
+                             [lessons[0], None, None])
+        candidates = json.loads(call.call_args.args[2][1]["content"])
+        self.assertEqual([item["passages"] for item in candidates], [
+            {"1": "The store posts stock online.", "2": "Use only parts in stock."},
+            {"1": "Ask the model to flag claims missing from your notes."},
+        ])
 
-    def test_empty_or_non_string_evidence_excludes_only_that_lesson(self):
-        articles = [{"title": "Test", "description": "Source evidence."}] * 3
-        reply = '{"evidence": [true, " ", "Source evidence."]}'
+    def test_invalid_passage_numbers_exclude_only_their_lessons(self):
+        articles = [{"title": "Test", "description": "Source evidence."}] * 5
+        reply = '{"evidence": [true, 0, "1", -1, 1]}'
         with patch.object(harvest, "chat_complete", return_value=completion(reply)):
             self.assertEqual(harvest.validate_takeaways(
-                Mock(), articles, ["First lesson", "Second lesson", "Third lesson"]),
-                [None, None, "Third lesson"])
+                Mock(), articles, ["Lesson"] * 5),
+                [None, None, None, None, "Lesson"])
 
     def test_no_candidates_avoids_provider_call(self):
         with patch.object(harvest, "chat_complete") as call:
