@@ -215,6 +215,14 @@ class GenerationFailureTests(unittest.TestCase):
                 individual.assert_not_called()
         self.assertNotIn("provider detail", output.getvalue())
 
+    def test_single_malformed_reply_preserves_other_lessons(self):
+        with patch.object(harvest, "chat_complete", side_effect=[
+            completion("not JSON"), completion(takeaways("word " * 29)),
+            completion(takeaways("A supported explanation.")),
+        ]):
+            result = harvest.summarize_all(Mock(), [self.article, self.article])
+        self.assertEqual(result, [None, "A supported explanation."])
+
     def test_malformed_batch_can_still_recover_with_valid_individual_output(self):
         with patch.object(harvest, "chat_complete", side_effect=[
             completion("not JSON"), completion(takeaways("A supported explanation.")),
@@ -330,9 +338,9 @@ class HarvestEntryPointTests(unittest.TestCase):
 
     def test_empty_individual_result_sends_nothing_and_preserves_history(self):
         calls = self.run_harvest([
-            completion("not JSON"), completion("  "),
+            completion("not JSON"), completion("  "), completion("  "),
         ], error="digest was not sent")
-        self.assertEqual(calls, 2)
+        self.assertEqual(calls, 3)
 
     def test_preview_never_sends_or_updates_history(self):
         self.assertEqual(self.run_harvest([completion(takeaways(
