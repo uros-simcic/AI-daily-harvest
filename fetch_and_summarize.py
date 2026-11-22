@@ -480,6 +480,10 @@ def validate_takeaways(client, articles, summaries):
     return checked
 
 
+class InvalidTakeawayReply(RuntimeError):
+    """The provider returned a reply that failed local takeaway validation."""
+
+
 def request_takeaways(client, articles):
     """Use the same teaching contract for batch and individual requests."""
     source = [{"title": article["title"],
@@ -489,13 +493,18 @@ def request_takeaways(client, articles):
         {"role": "system", "content": TAKEAWAY_INSTRUCTIONS},
         {"role": "user", "content": json.dumps(source)},
     ])
-    return parse_summaries(response.choices[0].message.content, len(articles))
+    try:
+        return parse_summaries(response.choices[0].message.content, len(articles))
+    except ValueError:
+        raise InvalidTakeawayReply("Takeaway generation failed; digest was not sent") from None
 
 
 def summarize(client, article):
     """Produce a takeaway or intentional skip; never use raw feed copy."""
     try:
         return request_takeaways(client, [article])[0]
+    except InvalidTakeawayReply:
+        raise
     except Exception as exc:
         print(f"[warn] takeaway generation failed: {type(exc).__name__}")
         raise RuntimeError("Takeaway generation failed; digest was not sent") from None
@@ -513,9 +522,18 @@ def summarize_all(client, articles):
             raise RuntimeError(
                 "Takeaway provider remains rate-limited; digest was not sent"
             ) from None
-    # None means an intentional skip, not a missing answer to retry.
-    # Any individual generation failure aborts before sending or saving.
-    return [summarize(client, article) for article in articles]
+    results = []
+    invalid = 0
+    for index, article in enumerate(articles, 1):
+        try:
+            results.append(summarize(client, article))
+        except InvalidTakeawayReply:
+            print(f"[warn] generation item {index}: excluded invalid_takeaway")
+            results.append(None)
+            invalid += 1
+    if invalid and not any(results):
+        raise RuntimeError("No valid takeaways after fallback; digest was not sent")
+    return results
 
 
 SIG_DESC_CHARS = 200  # description prefix that feeds a story signature
