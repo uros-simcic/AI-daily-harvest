@@ -7,7 +7,7 @@ practical lessons in one daily email.
 
 The app fetches recent articles, prepares the source text, generates teaching
 takeaways with Mistral, checks factual support and removes duplicate stories.
-Each takeaway is limited to 28 words. Duplicate checks use word overlap and
+Each takeaway is limited to 16 words. Duplicate checks use word overlap and
 the same Mistral model.
 
 Runs for free on GitHub Actions.
