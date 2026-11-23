@@ -147,10 +147,14 @@ class SummaryParseTests(unittest.TestCase):
         ]})
         self.assertEqual(parse_summaries(reply, 2), [None, "Cached inputs and generated outputs have separate pricing."])
 
+    def test_accepts_a_16_word_lesson(self):
+        lesson = " ".join(["word"] * 16)
+        self.assertEqual(parse_summaries(takeaways(lesson), 1), [lesson])
+
     def test_invalid_items_and_overlong_takeaways_are_rejected(self):
         cases = [None, [], {}, {"status": "skip", "reason": "other"},
                  {"status": "keep", "takeaway": "**"},
-                 {"status": "keep", "takeaway": "word " * 29}]
+                 {"status": "keep", "takeaway": "word " * 17}]
         for item in cases:
             with self.subTest(item=item):
                 with self.assertRaises(ValueError):
@@ -217,7 +221,7 @@ class GenerationFailureTests(unittest.TestCase):
 
     def test_single_malformed_reply_preserves_other_lessons(self):
         with patch.object(harvest, "chat_complete", side_effect=[
-            completion("not JSON"), completion(takeaways("word " * 29)),
+            completion("not JSON"), completion(takeaways("word " * 17)),
             completion(takeaways("A supported explanation.")),
         ]):
             result = harvest.summarize_all(Mock(), [self.article, self.article])
