@@ -1,20 +1,16 @@
 name: Daily News Harvest
 
 on:
-  schedule:
-    # 05:19 UTC, off the hour.
-    # Last merge-commit on this cron line sets the schedule actor.
-    # A GitHub App squash-merge sets the actor to the app and
-    # scheduled runs stop. Merge this file as a merge commit,
-    # logged in as the repo owner. Never squash.
-    - cron: "19 5 * * *"
-  # manual runs from the actions tab, for testing
   workflow_dispatch:
     inputs:
       preview:
         description: "Generate takeaways without sending email or updating history"
         type: boolean
         default: false
+      cases:
+        description: "Frozen four-story test input (JSON)"
+        type: string
+        required: true
 
 # the job only needs to read the repo, nothing more
 permissions:
@@ -22,6 +18,7 @@ permissions:
 
 jobs:
   send-harvest:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/check/four-real-stories' && inputs.preview
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -32,22 +29,79 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: restore list of already sent articles
-        uses: actions/cache@v6
-        with:
-          path: seen_titles.txt
-          # unique key per run + prefix restore: the newest list is
-          # restored at start, the updated one saved after the run
-          key: seen-titles-${{ github.run_id }}
-          restore-keys: seen-titles-
-
       - run: pip install -r requirements.txt
 
-      - name: fetch, summarize and send
+      - name: Test four real stories
         env:
-          HARVEST_PREVIEW: ${{ github.event_name == 'workflow_dispatch' && inputs.preview && '1' || '0' }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          GMAIL_TO: ${{ secrets.GMAIL_TO }}
-        run: python fetch_and_summarize.py
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from unittest.mock import patch
+          import fetch_and_summarize as harvest
+
+          raw = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())["inputs"]["cases"]
+          assert hashlib.sha256(raw.encode()).hexdigest() == "f82e600437cf5d7a9825c7023b1fa93a73cc903d853801b1d94c7ce7e34cce35"
+          articles = json.loads(raw)
+          labels = ["Sierra", "Gemini tutorial", "ML testing", "Vanta ad"]
+          assert len(articles) == len(labels)
+          by_title = {article["title"]: i for i, article in enumerate(articles)}
+          missing = object()
+          first = [missing] * len(articles)
+          request = harvest.chat_complete
+          harvest.RATE_LIMIT_RETRIES = 0
+
+          def observe(client, model, messages):
+              response = request(client, model, messages)
+              inputs = json.loads(messages[1]["content"])
+              reply = harvest.strip_json_fence(response.choices[0].message.content)
+              try:
+                  payload = json.loads(reply)
+              except ValueError:
+                  print("Generation returned invalid JSON")
+                  return response
+              rows = payload.get("items") if isinstance(payload, dict) else None
+              if not isinstance(rows, list) or len(rows) != len(inputs):
+                  print("Generation returned an unaligned batch")
+                  return response
+              for item, row in zip(inputs, rows, strict=True):
+                  i = by_title[item["title"]]
+                  try:
+                      lesson = harvest.parse_summaries(json.dumps({"items": [row]}), 1)[0]
+                      if len(inputs) == len(articles):
+                          first[i] = lesson
+                      decision = lesson if lesson is not None else row["reason"]
+                  except ValueError as error:
+                      draft = row.get("takeaway") if isinstance(row, dict) else None
+                      words = len(harvest.clean_summary(draft).split()) if isinstance(draft, str) else None
+                      decision = f"invalid ({error}, words={words})"
+                  print(f"{'batch' if len(inputs) > 1 else 'retry'} | {labels[i]} | {decision}")
+              return response
+
+          client = harvest.build_client()
+          with patch.object(harvest, "chat_complete", side_effect=observe):
+              try:
+                  current = harvest.summarize_all(client, articles)
+              except RuntimeError as error:
+                  if str(error) != "No valid takeaways after fallback; digest was not sent":
+                      raise
+                  current = [None] * len(articles)
+          protected = [old if initial is missing else initial for old, initial in zip(current, first, strict=True)]
+          variants = [("current", current), ("preserve valid rows", protected)]
+          candidates = list(dict.fromkeys((i, text) for _, variant in variants
+                                          for i, text in enumerate(variant) if text is not None))
+          verdicts = harvest.validate_takeaways(client, [articles[i] for i, _ in candidates],
+                                               [text for _, text in candidates])
+          checked = dict(zip(candidates, verdicts, strict=True))
+          for name, variant in variants:
+              results = [checked.get((i, text)) for i, text in enumerate(variant)]
+              for label, lesson in zip(labels, results, strict=True):
+                  print(f"{name} | {label} | {lesson or 'excluded'}")
+              print(f"{name} | three editorial lessons and ad excluded: "
+                    f"{[bool(x) for x in results] == [True, True, True, False]}")
+          if not all(checked.get((i, text)) for i, text in enumerate(protected[:3])) or checked.get((3, protected[3])):
+              raise SystemExit("Fixed-set acceptance criteria not met")
+          PY
