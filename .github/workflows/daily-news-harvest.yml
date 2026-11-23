@@ -22,6 +22,7 @@ permissions:
 
 jobs:
   send-harvest:
+    if: github.event_name == 'workflow_dispatch' && inputs.preview
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -32,22 +33,44 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: restore list of already sent articles
-        uses: actions/cache@v6
-        with:
-          path: seen_titles.txt
-          # unique key per run + prefix restore: the newest list is
-          # restored at start, the updated one saved after the run
-          key: seen-titles-${{ github.run_id }}
-          restore-keys: seen-titles-
-
       - run: pip install -r requirements.txt
 
-      - name: fetch, summarize and send
+      - name: Check lesson attribution
         env:
-          HARVEST_PREVIEW: ${{ github.event_name == 'workflow_dispatch' && inputs.preview && '1' || '0' }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          GMAIL_TO: ${{ secrets.GMAIL_TO }}
-        run: python fetch_and_summarize.py
+        run: |
+          python - <<'PY'
+          import fetch_and_summarize as harvest
+
+          # Constructed passages. Each pair changes one detail.
+          cases = [
+              ("Citation review", "Before publication the editor asked ChatGPT to verify each citation.",
+               "The editor asked ChatGPT to verify citations.",
+               "ChatGPT asked the editor to verify citations."),
+              ("Gemini memory use", "Google measured lower memory use by Gemini in its own benchmarks. Independent tests are pending.",
+               "Google’s benchmarks showed Gemini used less memory.",
+               "Independent benchmarks showed Gemini used less memory."),
+              ("Model measurements", "OpenAI observed new capabilities alongside lower perplexity in its own models. It evaluated no other models.",
+               "Lower perplexity accompanied new capabilities in OpenAI’s models.",
+               "Lower perplexity accompanied new capabilities in all models."),
+              ("Firmware rollout", "A hang affects a subset of hosts. The fix must reach every affected host. Other hosts need no update.",
+               "The fix must reach every affected host.",
+               "The fix must reach every host."),
+              ("Measuring AI development", "The author suggests using perplexity to set shared limits. The method has yet to be demonstrated.",
+               "The author proposes using perplexity to set shared limits.",
+               "The author demonstrates using perplexity to set shared limits."),
+          ]
+          articles = [{"title": title, "description": source} for title, source, _, _ in cases]
+          client = harvest.build_client()
+          matches = []
+          for batch in (0, 1):
+              expected = [(i + batch) % 2 == 0 for i in range(len(cases))]
+              lessons = [good if keep else bad for (_, _, good, bad), keep in zip(cases, expected)]
+              results = harvest.validate_takeaways(client, articles, lessons)
+              for lesson, result, keep in zip(lessons, results, expected, strict=True):
+                  kept = result is not None
+                  matches.append(kept == keep)
+                  print(f"{lesson} | expected keep={keep}, observed keep={kept}")
+          print(f"{sum(matches)}/{len(matches)} correct")
+          raise SystemExit(0 if all(matches) else 1)
+          PY
