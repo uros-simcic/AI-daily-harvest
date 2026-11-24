@@ -195,46 +195,37 @@ class GenerationFailureTests(unittest.TestCase):
             "description": "Register before prices increase at the door.",
         }
 
-    def test_failed_single_generation_does_not_return_feed_copy(self):
-        output = io.StringIO()
-        with patch.object(harvest, "chat_complete", side_effect=RuntimeError("provider detail")):
-            with contextlib.redirect_stdout(output):
-                with self.assertRaisesRegex(RuntimeError, "digest was not sent"):
-                    harvest.summarize(Mock(), self.article)
-        self.assertNotIn("provider detail", output.getvalue())
-        self.assertNotIn(self.article["title"], output.getvalue())
-
-    def test_empty_single_generation_does_not_return_feed_copy(self):
-        with patch.object(harvest, "chat_complete", return_value=completion("  ")):
-            with self.assertRaisesRegex(RuntimeError, "digest was not sent"):
-                harvest.summarize(Mock(), self.article)
-
-    def test_persistent_batch_rate_limit_does_not_start_individual_requests(self):
-        output = io.StringIO()
-        with patch.object(harvest, "chat_complete", side_effect=RuntimeError("429 provider detail")):
-            with patch.object(harvest, "summarize") as individual:
-                with contextlib.redirect_stdout(output):
-                    with self.assertRaisesRegex(RuntimeError, "remains rate-limited"):
-                        harvest.summarize_all(Mock(), [self.article, self.article])
-                individual.assert_not_called()
-        self.assertNotIn("provider detail", output.getvalue())
-
-    def test_single_malformed_reply_preserves_other_lessons(self):
+    def test_repair_only_unresolved_and_keep_source_alignment(self):
+        stories = [dict(self.article, title=name) for name in ("A", "B", "C")]
+        first = {"items": [{"status": "skip", "reason": "promotion"},
+                           {"status": "keep", "takeaway": "word " * 17},
+                           {"status": "keep", "takeaway": "Valid first draft."}]}
+        repaired = {"items": [{"status": "skip", "reason": "promotion"},
+                              {"status": "keep", "takeaway": "Register before prices increase.",
+                               "evidence": self.article["description"]}]}
         with patch.object(harvest, "chat_complete", side_effect=[
-            completion("not JSON"), completion(takeaways("word " * 17)),
-            completion(takeaways("A supported explanation.")),
-        ]):
-            result = harvest.summarize_all(Mock(), [self.article, self.article])
-        self.assertEqual(result, [None, "A supported explanation."])
-
-    def test_malformed_batch_can_still_recover_with_valid_individual_output(self):
-        with patch.object(harvest, "chat_complete", side_effect=[
-            completion("not JSON"), completion(takeaways("A supported explanation.")),
+            completion(json.dumps(first)), completion(json.dumps(repaired))
         ]) as request:
-            with contextlib.redirect_stdout(io.StringIO()):
-                result = harvest.summarize_all(Mock(), [self.article])
-        self.assertEqual(result, ["A supported explanation."])
-        self.assertEqual(request.call_count, 2)
+            self.assertEqual(harvest.summarize_all(Mock(), stories),
+                             [None, "Register before prices increase.", "Valid first draft."])
+        inputs = json.loads(request.call_args.args[2][1]["content"])
+        self.assertEqual([x["title"] for x in inputs], ["A", "B"])
+        self.assertEqual(inputs[1]["previous_draft"], "word " * 17)
+
+    def test_fabricated_repair_evidence_is_excluded(self):
+        first = completion(takeaways("Valid first draft.", "word " * 17))
+        repair = completion(json.dumps({"items": [{"status": "keep", "takeaway": "New.",
+                                                  "evidence": "Invented source."}]}))
+        with patch.object(harvest, "chat_complete", side_effect=[first, repair]):
+            self.assertEqual(harvest.summarize_all(Mock(), [self.article] * 2),
+                             ["Valid first draft.", None])
+
+    def test_repair_outage_preserves_valid_first_draft(self):
+        with patch.object(harvest, "chat_complete", side_effect=[
+            completion(takeaways("Valid first draft.", "word " * 17)), RuntimeError("offline")
+        ]):
+            self.assertEqual(harvest.summarize_all(Mock(), [self.article] * 2),
+                             ["Valid first draft.", None])
 
 
 class HarvestEntryPointTests(unittest.TestCase):
@@ -267,7 +258,7 @@ class HarvestEntryPointTests(unittest.TestCase):
             if messages[0]["content"] == harvest.GROUNDING_INSTRUCTIONS:
                 count = len(json.loads(messages[1]["content"]))
                 return completion(json.dumps({"supported": [True] * count}))
-            if messages[0]["content"] != harvest.TAKEAWAY_INSTRUCTIONS:
+            if messages[0]["content"] not in (harvest.TAKEAWAY_INSTRUCTIONS, harvest.REPAIR_INSTRUCTIONS):
                 return completion('{"groups": []}')
             return generation_replies()
 
@@ -335,16 +326,15 @@ class HarvestEntryPointTests(unittest.TestCase):
     def test_partial_generation_then_failure_sends_nothing_and_preserves_history(self):
         calls = self.run_harvest([
             completion("not JSON"),
-            completion(takeaways("A supported explanation for the first item.")),
             RuntimeError("provider unavailable"),
         ], error="digest was not sent")
-        self.assertEqual(calls, 3)
+        self.assertEqual(calls, 2)
 
     def test_empty_individual_result_sends_nothing_and_preserves_history(self):
         calls = self.run_harvest([
-            completion("not JSON"), completion("  "), completion("  "),
+            completion("not JSON"), completion("  "),
         ], error="digest was not sent")
-        self.assertEqual(calls, 3)
+        self.assertEqual(calls, 2)
 
     def test_preview_never_sends_or_updates_history(self):
         self.assertEqual(self.run_harvest([completion(takeaways(
@@ -357,7 +347,7 @@ class HarvestEntryPointTests(unittest.TestCase):
             {"status": "skip", "reason": "promotion"},
             {"status": "skip", "reason": "insufficient_source"},
         ]})
-        self.assertEqual(self.run_harvest([completion(reply)], all_skipped=True), 1)
+        self.assertEqual(self.run_harvest([completion(reply), completion(reply)], all_skipped=True), 2)
 
     def test_partial_batch_reports_partial_and_preserves_existing_history_policy(self):
         self.assertEqual(self.run_harvest([completion(takeaways(
