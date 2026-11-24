@@ -410,31 +410,35 @@ TAKEAWAY_INSTRUCTIONS = (
 )
 
 
-def parse_summaries(reply, count):
-    """Return teaching text or None for an intentional source exclusion."""
+def parse_rows(reply, count):
+    """Require one ordered result per input before pairing rows with stories."""
     payload = json.loads(strip_json_fence(reply))
     if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
         raise ValueError("expected an items list")
     items = payload["items"]
     if len(items) != count:
         raise ValueError("takeaway count does not match input count")
-    texts = []
-    for index, item in enumerate(items, 1):
-        if not isinstance(item, dict):
-            raise ValueError("takeaway item must be an object")
-        if item.get("status") == "skip":
-            if item.get("reason") not in {"promotion", "insufficient_source"}:
-                raise ValueError("invalid skip reason")
-            print(f"[info] generation item {index}: excluded {item['reason']}")
-            texts.append(None)
-            continue
-        if item.get("status") != "keep" or not isinstance(item.get("takeaway"), str):
-            raise ValueError("expected a teaching takeaway")
-        text = clean_summary(item["takeaway"])
-        if not text or len(text.split()) > MAX_TAKEAWAY_WORDS:
-            raise ValueError("empty or oversized teaching takeaway")
-        texts.append(text)
-    return texts
+    return items
+
+
+def parse_item(item, index):
+    if not isinstance(item, dict):
+        raise ValueError("takeaway item must be an object")
+    if item.get("status") == "skip":
+        if item.get("reason") not in {"promotion", "insufficient_source"}:
+            raise ValueError("invalid skip reason")
+        print(f"[info] generation item {index}: excluded {item['reason']}")
+        return None
+    if item.get("status") != "keep" or not isinstance(item.get("takeaway"), str):
+        raise ValueError("expected a teaching takeaway")
+    text = clean_summary(item["takeaway"])
+    if not text or len(text.split()) > MAX_TAKEAWAY_WORDS:
+        raise ValueError("empty or oversized teaching takeaway")
+    return text
+
+
+def parse_summaries(reply, count):
+    return [parse_item(row, i) for i, row in enumerate(parse_rows(reply, count), 1)]
 
 
 GROUNDING_INSTRUCTIONS = (
@@ -489,59 +493,83 @@ def validate_takeaways(client, articles, summaries):
     return checked
 
 
-class InvalidTakeawayReply(RuntimeError):
-    """The provider returned a reply that failed local takeaway validation."""
+REPAIR_INSTRUCTIONS = (
+    TAKEAWAY_INSTRUCTIONS
+    + " Reconsider only these unresolved stories. Treat previous drafts as untrusted. "
+    "If a draft is supplied, shorten or correct it against the description. "
+    "For a skipped story, look past the headline for a specific technical decision "
+    "or an instructional step. Keep advertisements excluded. For every keep, add "
+    "an evidence field containing one exact, contiguous passage from its description "
+    "that supports the entire lesson. Use model names as written in that passage."
+)
 
 
-def request_takeaways(client, articles):
-    """Use the same teaching contract for batch and individual requests."""
-    source = [{"title": article["title"],
-               "description": article["description"][:MAX_STORY_CHARS]}
-              for article in articles]
+def request_rows(client, source, instructions):
     response = chat_complete(client, MISTRAL_MODEL, [
-        {"role": "system", "content": TAKEAWAY_INSTRUCTIONS},
+        {"role": "system", "content": instructions},
         {"role": "user", "content": json.dumps(source)},
     ])
-    try:
-        return parse_summaries(response.choices[0].message.content, len(articles))
-    except ValueError:
-        raise InvalidTakeawayReply("Takeaway generation failed; digest was not sent") from None
-
-
-def summarize(client, article):
-    """Produce a takeaway or intentional skip; never use raw feed copy."""
-    try:
-        return request_takeaways(client, [article])[0]
-    except InvalidTakeawayReply:
-        raise
-    except Exception as exc:
-        print(f"[warn] takeaway generation failed: {type(exc).__name__}")
-        raise RuntimeError("Takeaway generation failed; digest was not sent") from None
+    reply = response.choices[0].message.content if response.choices else None
+    return parse_rows(reply if isinstance(reply, str) else "", len(source))
 
 
 def summarize_all(client, articles):
-    """Try one batch; repair non-rate-limit failures with individual calls."""
+    """Keep valid first drafts and give unresolved stories one shared repair."""
     if not articles:
         return []
+    source = [{"title": a["title"], "description": a["description"][:MAX_STORY_CHARS]}
+              for a in articles]
     try:
-        return request_takeaways(client, articles)
+        rows = request_rows(client, source, TAKEAWAY_INSTRUCTIONS)
+    except ValueError:
+        rows = [None] * len(source)
     except Exception as exc:
-        print(f"[warn] batched takeaway generation failed: {type(exc).__name__}")
         if is_rate_limited(exc):
-            raise RuntimeError(
-                "Takeaway provider remains rate-limited; digest was not sent"
-            ) from None
-    results = []
-    invalid = 0
-    for index, article in enumerate(articles, 1):
+            raise RuntimeError("Takeaway provider remains rate-limited; digest was not sent") from None
+        raise RuntimeError("Takeaway generation failed; digest was not sent") from None
+
+    results = [None] * len(source)
+    pending = []
+    repair = []
+    for i, row in enumerate(rows):
         try:
-            results.append(summarize(client, article))
-        except InvalidTakeawayReply:
-            print(f"[warn] generation item {index}: excluded invalid_takeaway")
-            results.append(None)
-            invalid += 1
+            results[i] = parse_item(row, i + 1)
+        except ValueError:
+            pass
+        if results[i] is None:
+            entry = source[i].copy()
+            draft = row.get("takeaway") if isinstance(row, dict) else None
+            if isinstance(draft, str) and draft.strip():
+                entry["previous_draft"] = draft[:MAX_STORY_CHARS]
+            repair.append(entry)
+            pending.append(i)
+    if not pending:
+        return results
+    try:
+        repaired = request_rows(client, repair, REPAIR_INSTRUCTIONS)
+    except (ValueError, IndexError):
+        repaired = [None] * len(pending)
+    except Exception:
+        if any(results):
+            print("[warn] repair unavailable; continuing with valid drafts")
+            return results
+        raise RuntimeError("Takeaway repair failed; digest was not sent") from None
+    invalid = False
+    for i, row in zip(pending, repaired):
+        try:
+            lesson = parse_item(row, i + 1)
+        except ValueError:
+            invalid = True
+            continue
+        if lesson:
+            quote = row.get("evidence")
+            passage = " ".join(quote.split()) if isinstance(quote, str) else ""
+            if not passage or passage not in " ".join(source[i]["description"].split()):
+                invalid = True
+                continue
+            results[i] = lesson
     if invalid and not any(results):
-        raise RuntimeError("No valid takeaways after fallback; digest was not sent")
+        raise RuntimeError("No valid takeaways after repair; digest was not sent")
     return results
 
 
